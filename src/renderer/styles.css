@@ -111,6 +111,29 @@ button:hover {
   margin-top: 0;
 }
 
+.timeline-mode-row {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.55rem;
+}
+
+.timeline-mode-row button {
+  flex: 1;
+  background: rgba(15, 134, 152, 0.18);
+  color: #19404a;
+}
+
+.timeline-mode-row button.mode-active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.timeline-warning {
+  margin: 0.45rem 0 0.6rem;
+  color: #9f1f2c;
+  font-weight: 600;
+}
+
 .timeline-list {
   display: grid;
   gap: 0.4rem;
@@ -265,6 +288,59 @@ button:hover {
 .timeline-column h3 {
   margin: 0 0 0.5rem;
   font-size: 0.95rem;
+  text-align: center;
+}
+
+.timeline-column-title {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  user-select: none;
+}
+
+.timeline-column-title:active {
+  cursor: grabbing;
+}
+
+.timeline-column-title.non-draggable {
+  cursor: default;
+}
+
+.timeline-width-handle {
+  position: absolute;
+  right: -0.6rem;
+  top: 0.15rem;
+  bottom: 0.15rem;
+  width: 8px;
+  border-radius: 99px;
+  background: rgba(15, 134, 152, 0.35);
+  cursor: ew-resize;
+}
+
+.timeline-width-handle:hover {
+  background: rgba(15, 134, 152, 0.65);
+}
+
+.timeline-column-title.drop-before::before,
+.timeline-column-title.drop-after::after {
+  content: '';
+  position: absolute;
+  top: 0.1rem;
+  bottom: 0.1rem;
+  width: 3px;
+  border-radius: 99px;
+  background: var(--accent-2);
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.85);
+}
+
+.timeline-column-title.drop-before::before {
+  left: -0.55rem;
+}
+
+.timeline-column-title.drop-after::after {
+  right: -0.55rem;
 }
 
 .timeline-axis {
@@ -329,6 +405,97 @@ button:hover {
 
 .anchor-point:active {
   cursor: grabbing;
+}
+
+.timeline-bubble {
+  position: absolute;
+  min-height: 24px;
+  width: 180px;
+  max-width: 360px;
+  border-radius: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.95);
+  color: #1f2933;
+  font-size: 0.76rem;
+  font-weight: 600;
+  padding: 0.22rem 0.55rem;
+  background: #fff7dc;
+  box-shadow: 0 7px 16px rgba(20, 20, 20, 0.2);
+  cursor: grab;
+  z-index: 3;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.35rem;
+  transform: translateY(-50%);
+  transition: top 180ms ease, width 160ms ease, max-width 160ms ease, left 180ms ease;
+  will-change: top, width, max-width, left;
+}
+
+.timeline-bubble > span:first-child {
+  pointer-events: none;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.2;
+  flex: 1;
+}
+
+.timeline-bubble:active {
+  cursor: grabbing;
+}
+
+.timeline-bubble.is-dragging {
+  transition: none;
+  z-index: 6;
+}
+
+.bubble-left {
+  left: auto;
+  right: calc(50% + 14px);
+}
+
+.bubble-right {
+  right: auto;
+  left: calc(50% + 14px);
+}
+
+.bubble-left::after,
+.bubble-right::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  width: 0;
+  height: 0;
+  transform: translateY(-50%);
+}
+
+.bubble-left::after {
+  right: -10px;
+  border-top: 7px solid transparent;
+  border-bottom: 7px solid transparent;
+  border-left: 10px solid #fff7dc;
+}
+
+.bubble-right::after {
+  left: -10px;
+  border-top: 7px solid transparent;
+  border-bottom: 7px solid transparent;
+  border-right: 10px solid #fff7dc;
+}
+
+.bubble-dependency-handle {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  border: 2px solid #fff;
+  background: rgba(215, 58, 73, 0.9);
+  cursor: alias;
+  flex: 0 0 auto;
+  margin-top: 0.2rem;
+  pointer-events: auto;
+}
+
+.bubble-dependency-line {
+  pointer-events: stroke;
+  cursor: context-menu;
 }
 
 .point-link-handle {
