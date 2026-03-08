@@ -14,6 +14,8 @@
     "build:main": "vite build --config vite.main.config.ts",
     "build:preload": "vite build --config vite.preload.config.ts",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "dist": "npm run build && electron-builder"
   },
   "dependencies": {
@@ -30,16 +32,18 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.13.10",
-    "@types/react-big-calendar": "^1.16.1",
     "@types/react": "^18.3.20",
+    "@types/react-big-calendar": "^1.16.1",
     "@types/react-dom": "^18.3.6",
     "@types/uuid": "^10.0.0",
     "@vitejs/plugin-react": "^4.3.4",
     "concurrently": "^9.1.2",
     "electron": "^35.0.0",
     "electron-builder": "^26.8.1",
+    "jsdom": "^28.1.0",
     "typescript": "^5.8.2",
     "vite": "^6.2.2",
+    "vitest": "^4.0.18",
     "wait-on": "^8.0.3"
   },
   "build": {

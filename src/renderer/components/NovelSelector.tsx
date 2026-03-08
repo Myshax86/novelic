@@ -13,6 +13,7 @@ export function NovelSelector() {
       <h2>Novels</h2>
       <div className="selector-row">
         <select
+          aria-label="Select novel"
           value={currentNovel?.id ?? ''}
           onChange={(e) => {
             if (e.target.value) selectNovel(e.target.value);
@@ -28,6 +29,7 @@ export function NovelSelector() {
       </div>
       <div className="selector-row">
         <input
+          aria-label="New novel name"
           placeholder="New novel name"
           value={name}
           onChange={(e) => setName(e.target.value)}

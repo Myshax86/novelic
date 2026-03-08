@@ -44,6 +44,7 @@ function clamp01(value: number): number {
 
 export function TimelinePanel() {
   const panelRef = useRef<HTMLElement | null>(null);
+  const lastHoverYearRef = useRef<number | null>(null);
 
   const timelines = useNovelStore((s) => s.timelines);
   const currentNovel = useNovelStore((s) => s.currentNovel);
@@ -271,10 +272,18 @@ export function TimelinePanel() {
     <section className="panel timeline-panel" ref={panelRef}>
       <h2>Timeline Anchors</h2>
       <div className="timeline-mode-row">
-        <button className={mode === 'point' ? 'mode-active' : ''} onClick={() => setMode('point')}>
+        <button
+          aria-pressed={mode === 'point'}
+          className={mode === 'point' ? 'mode-active' : ''}
+          onClick={() => setMode('point')}
+        >
           Point Mode
         </button>
-        <button className={mode === 'event' ? 'mode-active' : ''} onClick={() => setMode('event')}>
+        <button
+          aria-pressed={mode === 'event'}
+          className={mode === 'event' ? 'mode-active' : ''}
+          onClick={() => setMode('event')}
+        >
           Event Mode
         </button>
       </div>
@@ -421,10 +430,14 @@ export function TimelinePanel() {
                     const nextPosition = clamp01(y / AXIS_HEIGHT);
                     setHoverState({ timelineId: column.id, position: nextPosition });
                     const fakeYear = 1900 + Math.round(nextPosition * 200);
-                    setCursor(new Date(Date.UTC(fakeYear, 0, 1)).toISOString());
+                    if (lastHoverYearRef.current !== fakeYear) {
+                      lastHoverYearRef.current = fakeYear;
+                      setCursor(new Date(Date.UTC(fakeYear, 0, 1)).toISOString());
+                    }
                   }}
                   onMouseLeave={() => {
                     setHoverState(null);
+                    lastHoverYearRef.current = null;
                     setCursor(null);
                   }}
                 >

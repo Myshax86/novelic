@@ -8,6 +8,8 @@ export function Sidebar() {
   const timelines = useNovelStore((s) => s.timelines);
   const setSearchQuery = useNovelStore((s) => s.setSearchQuery);
   const searchQuery = useNovelStore((s) => s.searchQuery);
+  const lastError = useNovelStore((s) => s.lastError);
+  const clearError = useNovelStore((s) => s.clearError);
   const createTimeline = useNovelStore((s) => s.createTimeline);
   const updateTimelineName = useNovelStore((s) => s.updateTimelineName);
   const updateTimelineColor = useNovelStore((s) => s.updateTimelineColor);
@@ -25,7 +27,16 @@ export function Sidebar() {
   return (
     <aside className="panel sidebar-panel">
       <h2>Tools</h2>
+      {lastError && (
+        <div className="sidebar-error" role="alert">
+          <span>{lastError}</span>
+          <button type="button" onClick={clearError}>
+            Dismiss
+          </button>
+        </div>
+      )}
       <input
+        aria-label="Search events"
         placeholder="Search events"
         value={searchQuery}
         onChange={(e) => setSearchQuery(e.target.value)}
@@ -43,6 +54,7 @@ export function Sidebar() {
       <h3>Timelines</h3>
       <div className="selector-row">
         <input
+          aria-label="Timeline name"
           placeholder="Timeline name"
           value={timelineName}
           onChange={(e) => setTimelineName(e.target.value)}

@@ -15,6 +15,7 @@ Desktop app for novel writers to manage multiple timelines, drag events, and ins
 - SQLite schema (`novels`, `timelines`, `events`, `snapshots`) with WAL mode
 - IPC handlers for CRUD, overlap query, snapshots, export/import
 - Zustand state store with in-memory undo/redo (max 50 snapshots) persisted to DB snapshots
+- DB snapshot retention guard (keeps latest 200 snapshots per novel)
 - Multi-timeline calendar view with drag-and-drop event movement
 - Event create/edit modal, delete action, search/filter sidebar
 - Export full novel to JSON and timeline to CSV
@@ -33,6 +34,7 @@ Desktop app for novel writers to manage multiple timelines, drag events, and ins
 npm install
 npm run dev
 npm run typecheck
+npm run test
 npm run build
 npm run dist
 ```
@@ -44,7 +46,14 @@ npm run dist
 - Drag events in calendar updates DB
 - Cursor overlap panel updates from `events:getOverlapping`
 - Undo/redo updates both UI state and DB payload
+- Snapshot table remains bounded per novel (latest 200 retained)
 - Export/import round-trip preserves timelines/events
+
+## Quick Manual Verification
+
+- Perform many edits (create/update/delete events or timelines) so snapshots are created.
+- Restart app and verify undo/redo still works from recent history.
+- Optional DB check: inspect `snapshots` for a novel and confirm count does not exceed 200.
 
 ## Notes
 

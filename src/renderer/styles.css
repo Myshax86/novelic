@@ -134,6 +134,25 @@ button:hover {
   font-weight: 600;
 }
 
+.sidebar-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin: 0.5rem 0;
+  padding: 0.45rem 0.6rem;
+  border-radius: 10px;
+  background: rgba(215, 58, 73, 0.14);
+  color: #7f1320;
+  font-size: 0.85rem;
+}
+
+.sidebar-error button {
+  background: #b33646;
+  padding: 0.25rem 0.55rem;
+  font-size: 0.78rem;
+}
+
 .timeline-list {
   display: grid;
   gap: 0.4rem;

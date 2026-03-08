@@ -13,6 +13,7 @@ import type {
 } from '../../shared/types';
 
 const nowIso = () => new Date().toISOString();
+const SNAPSHOT_RETENTION_LIMIT = 200;
 
 export const dbQueries = {
   listNovels(): Novel[] {
@@ -150,7 +151,25 @@ export const dbQueries = {
       payload,
       created_at: nowIso()
     };
-    db.prepare('INSERT INTO snapshots (id, novel_id, payload, created_at) VALUES (@id, @novel_id, @payload, @created_at)').run(snapshot);
+
+    const tx = db.transaction(() => {
+      db.prepare('INSERT INTO snapshots (id, novel_id, payload, created_at) VALUES (@id, @novel_id, @payload, @created_at)').run(snapshot);
+
+      // Keep snapshot history bounded per novel to avoid unbounded DB growth.
+      db.prepare(
+        `DELETE FROM snapshots
+         WHERE novel_id = ?
+           AND id NOT IN (
+             SELECT id
+             FROM snapshots
+             WHERE novel_id = ?
+             ORDER BY created_at DESC
+             LIMIT ?
+           )`
+      ).run(novelId, novelId, SNAPSHOT_RETENTION_LIMIT);
+    });
+
+    tx();
     return snapshot;
   },
 
