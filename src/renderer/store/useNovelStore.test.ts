@@ -138,4 +138,33 @@ describe('useNovelStore timeline undo consistency', () => {
     expect(createSnapshotMock).toHaveBeenCalledTimes(3);
     expect(state.lastError).toBeNull();
   });
+
+  it('grows vertical timeline extent lazily with tight cap', () => {
+    useNovelStore.setState({
+      currentNovel: novel,
+      timePointsByNovel: {
+        [novel.id]: [
+          {
+            id: 'p1',
+            label: 'Start',
+            position: 0.1,
+            timeline_id: '__main_timeline__'
+          }
+        ]
+      },
+      bubbleEventsByNovel: {
+        [novel.id]: []
+      },
+      timelineVerticalMaxByNovel: {
+        [novel.id]: 1
+      }
+    });
+
+    const first = useNovelStore.getState().ensureTimelineVerticalExtent(0.95);
+    expect(first).toBeGreaterThan(1);
+    expect(first).toBeLessThanOrEqual(1.95);
+
+    const state = useNovelStore.getState();
+    expect(state.timelineVerticalMaxByNovel[novel.id]).toBe(first);
+  });
 });

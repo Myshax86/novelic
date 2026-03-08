@@ -53,6 +53,7 @@ interface NovelStore {
   bubbleEventsByNovel: Record<string, TimelineBubbleEvent[]>;
   eventDependenciesByNovel: Record<string, TimelineEventDependency[]>;
   timelineColumnWidthsByNovel: Record<string, Record<string, number>>;
+  timelineVerticalMaxByNovel: Record<string, number>;
   clearError: () => void;
   initialize: () => Promise<void>;
   createNovel: (name: string) => Promise<void>;
@@ -85,6 +86,7 @@ interface NovelStore {
   deleteEventDependency: (dependencyId: string) => void;
   setBubbleEventSide: (eventId: string, side: BubbleSide) => void;
   setTimelineColumnWidth: (timelineId: string, width: number) => void;
+  ensureTimelineVerticalExtent: (requestedPosition: number) => number;
   reorderTimelines: (
     sourceTimelineId: string,
     targetTimelineId: string,
@@ -93,6 +95,11 @@ interface NovelStore {
 }
 
 const CURSOR_QUERY_DEBOUNCE_MS = 80;
+const DEFAULT_TIMELINE_VERTICAL_MAX = 1;
+const VERTICAL_EDGE_GROWTH_CHUNK = 0.25;
+const VERTICAL_HEADROOM_VIEWPORTS = 1;
+const VERTICAL_MIN_FORWARD_BUFFER = 0.2;
+const VERTICAL_MAX_HARD_LIMIT = 24;
 
 let cursorQueryTimer: number | null = null;
 let cursorQueryToken = 0;
@@ -110,6 +117,30 @@ function toErrorMessage(error: unknown): string {
     return error.message;
   }
   return 'Unexpected operation failure.';
+}
+
+function clampPosition(value: number, maxPosition: number): number {
+  return Math.max(0, Math.min(maxPosition, value));
+}
+
+function timelineContentMaxPosition(points: TimePoint[], bubbles: TimelineBubbleEvent[]): number {
+  const pointsById = new Map(points.map((point) => [point.id, point]));
+  let maxPosition = DEFAULT_TIMELINE_VERTICAL_MAX;
+
+  points.forEach((point) => {
+    if (point.position > maxPosition) {
+      maxPosition = point.position;
+    }
+  });
+
+  bubbles.forEach((event) => {
+    const pos = bubblePosition(event, pointsById);
+    if (pos > maxPosition) {
+      maxPosition = pos;
+    }
+  });
+
+  return maxPosition;
 }
 
 async function pushSnapshotToDb(snapshot: LocalSnapshot): Promise<void> {
@@ -134,6 +165,7 @@ export const useNovelStore = create<NovelStore>()(
       bubbleEventsByNovel: {},
       eventDependenciesByNovel: {},
       timelineColumnWidthsByNovel: {},
+      timelineVerticalMaxByNovel: {},
 
       clearError: () => set({ lastError: null }),
 
@@ -486,11 +518,13 @@ export const useNovelStore = create<NovelStore>()(
       addTimePoint: (label, position, timelineId) => {
         const novelId = get().currentNovel?.id;
         if (!novelId) return;
+        const verticalMax =
+          get().timelineVerticalMaxByNovel[novelId] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
         const existing = get().timePointsByNovel[novelId] ?? [];
         const point: TimePoint = {
           id: uuidv4(),
           label: label.trim(),
-          position: Math.max(0, Math.min(1, position)),
+          position: clampPosition(position, verticalMax),
           timeline_id: timelineId
         };
         const next = [...existing, point].sort((a, b) => a.position - b.position);
@@ -519,7 +553,9 @@ export const useNovelStore = create<NovelStore>()(
         const novelId = get().currentNovel?.id;
         if (!novelId) return;
         const existing = get().timePointsByNovel[novelId] ?? [];
-        const clamped = Math.max(0, Math.min(1, position));
+        const verticalMax =
+          get().timelineVerticalMaxByNovel[novelId] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
+        const clamped = clampPosition(position, verticalMax);
         const connections = get().timePointConnectionsByNovel[novelId] ?? [];
 
         // Move all points in the connected component so linked points stay horizontally aligned.
@@ -653,14 +689,17 @@ export const useNovelStore = create<NovelStore>()(
       addBubbleEvent: (title, timelineId, preferredPosition) => {
         const novelId = get().currentNovel?.id;
         if (!novelId || !title.trim()) return false;
+        const verticalMax =
+          get().timelineVerticalMaxByNovel[novelId] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
 
         const points = get().timePointsByNovel[novelId] ?? [];
-        const anchor = selectAnchorPoint(points, timelineId, preferredPosition);
+        const clampedPreferred = clampPosition(preferredPosition, verticalMax);
+        const anchor = selectAnchorPoint(points, timelineId, clampedPreferred);
         if (!anchor) return false;
 
         const existing = get().bubbleEventsByNovel[novelId] ?? [];
         const sameTimelineCount = existing.filter((event) => event.timeline_id === timelineId).length;
-        const offset = preferredPosition - anchor.position;
+        const offset = clampedPreferred - anchor.position;
         const next: TimelineBubbleEvent[] = [
           ...existing,
           {
@@ -700,6 +739,8 @@ export const useNovelStore = create<NovelStore>()(
       moveBubbleEvent: (eventId, nextPosition) => {
         const novelId = get().currentNovel?.id;
         if (!novelId) return false;
+        const verticalMax =
+          get().timelineVerticalMaxByNovel[novelId] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
 
         const points = get().timePointsByNovel[novelId] ?? [];
         const bubbles = get().bubbleEventsByNovel[novelId] ?? [];
@@ -710,12 +751,12 @@ export const useNovelStore = create<NovelStore>()(
         if (!selectAnchorPoint(points, target.timeline_id, nextPosition)) return false;
 
         const pointsById = new Map(points.map((point) => [point.id, point]));
-        const clamped = Math.max(0, Math.min(1, nextPosition));
+        const clamped = clampPosition(nextPosition, verticalMax);
         if (!canMoveBubbleEvent(target, clamped, bubbles, deps, pointsById)) return false;
 
         const next = bubbles.map((event) =>
           event.id === eventId
-            ? desiredBubblePosition(event, clamped, points)
+            ? desiredBubblePosition(event, clamped, points, verticalMax)
             : event
         );
 
@@ -731,6 +772,8 @@ export const useNovelStore = create<NovelStore>()(
       settleBubbleEventPosition: (eventId) => {
         const novelId = get().currentNovel?.id;
         if (!novelId) return false;
+        const verticalMax =
+          get().timelineVerticalMaxByNovel[novelId] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
 
         const points = get().timePointsByNovel[novelId] ?? [];
         const bubbles = get().bubbleEventsByNovel[novelId] ?? [];
@@ -752,7 +795,8 @@ export const useNovelStore = create<NovelStore>()(
           currentPosition,
           currentPosition,
           points,
-          sideLockById
+          sideLockById,
+          verticalMax
         );
         const resolvedZones: BubbleZone[] = resolved.map((event) => ({
           id: event.id,
@@ -765,18 +809,20 @@ export const useNovelStore = create<NovelStore>()(
           timelinePoints,
           resolved,
           eventId,
-          currentPosition
+          currentPosition,
+          verticalMax
         );
 
         const shiftedPointById = new Map(shiftedTimelinePoints.map((point) => [point.id, point]));
         const candidatePoints = points.map((point) => shiftedPointById.get(point.id) ?? point);
         const connections = get().timePointConnectionsByNovel[novelId] ?? [];
-        const alignedPoints = alignConnectedPoints(points, candidatePoints, connections);
+        const alignedPoints = alignConnectedPoints(points, candidatePoints, connections, verticalMax);
         const nextPoints = enforceComponentPointClearance(
           alignedPoints,
           connections,
           resolvedZones,
-          eventId
+          eventId,
+          verticalMax
         );
 
         const finalById = new Map(nextPoints.map((point) => [point.id, point]));
@@ -810,11 +856,11 @@ export const useNovelStore = create<NovelStore>()(
                   ...event,
                   offset: lock === 'above' ? -Math.abs(event.offset || BASE_MIN_GAP) : Math.abs(event.offset || BASE_MIN_GAP)
                 };
-          const bounds = eventScopeBounds(proxyEvent, nextPoints);
+          const bounds = eventScopeBounds(proxyEvent, nextPoints, verticalMax);
           const currentPos = bubblePosition(event, finalPointsById);
           const clampedPos = Math.max(bounds.min, Math.min(bounds.max, currentPos));
           if (Math.abs(clampedPos - currentPos) < 0.000001) return event;
-          return anchoredBubblePosition(event, clampedPos, finalPointsById, nextPoints);
+          return anchoredBubblePosition(event, clampedPos, finalPointsById, nextPoints, verticalMax);
         });
 
         const movingAfterClamp = scopeClampedResolved.find((event) => event.id === eventId);
@@ -825,7 +871,8 @@ export const useNovelStore = create<NovelStore>()(
           currentPosition,
           currentPosition,
           nextPoints,
-          sideLockById
+          sideLockById,
+          verticalMax
         );
 
         const stabilizedPointsById = new Map(nextPoints.map((point) => [point.id, point]));
@@ -840,7 +887,8 @@ export const useNovelStore = create<NovelStore>()(
           nextPoints,
           connections,
           stabilizedZones,
-          eventId
+          eventId,
+          verticalMax
         );
 
         const nextPointsById = new Map(nextPoints.map((point) => [point.id, point]));
@@ -974,6 +1022,48 @@ export const useNovelStore = create<NovelStore>()(
         });
       },
 
+      ensureTimelineVerticalExtent: (requestedPosition) => {
+        const novelId = get().currentNovel?.id;
+        if (!novelId) return DEFAULT_TIMELINE_VERTICAL_MAX;
+
+        const points = get().timePointsByNovel[novelId] ?? [];
+        const bubbles = get().bubbleEventsByNovel[novelId] ?? [];
+        const contentMax = timelineContentMaxPosition(points, bubbles);
+
+        const currentMax =
+          get().timelineVerticalMaxByNovel[novelId] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
+        const safeRequested = Math.max(0, requestedPosition);
+        const desiredContentMax = Math.max(contentMax, safeRequested);
+
+        const headroomCap = Math.max(
+          DEFAULT_TIMELINE_VERTICAL_MAX,
+          Math.min(VERTICAL_MAX_HARD_LIMIT, desiredContentMax + VERTICAL_HEADROOM_VIEWPORTS)
+        );
+        const growthFloor = Math.max(currentMax, safeRequested + VERTICAL_MIN_FORWARD_BUFFER);
+        let nextMax = currentMax;
+
+        if (safeRequested >= currentMax - VERTICAL_MIN_FORWARD_BUFFER) {
+          nextMax = Math.min(
+            headroomCap,
+            Math.max(growthFloor, currentMax + VERTICAL_EDGE_GROWTH_CHUNK)
+          );
+        }
+
+        const tightened = Math.max(DEFAULT_TIMELINE_VERTICAL_MAX, Math.min(nextMax, headroomCap));
+
+        if (Math.abs(tightened - currentMax) < 0.000001) {
+          return currentMax;
+        }
+
+        set({
+          timelineVerticalMaxByNovel: {
+            ...get().timelineVerticalMaxByNovel,
+            [novelId]: tightened
+          }
+        });
+        return tightened;
+      },
+
       reorderTimelines: async (sourceTimelineId, targetTimelineId, dropPosition) => {
         set({ lastError: null });
         try {
@@ -1025,7 +1115,8 @@ export const useNovelStore = create<NovelStore>()(
         timePointConnectionsByNovel: state.timePointConnectionsByNovel,
         bubbleEventsByNovel: state.bubbleEventsByNovel,
         eventDependenciesByNovel: state.eventDependenciesByNovel,
-        timelineColumnWidthsByNovel: state.timelineColumnWidthsByNovel
+        timelineColumnWidthsByNovel: state.timelineColumnWidthsByNovel,
+        timelineVerticalMaxByNovel: state.timelineVerticalMaxByNovel
       })
     }
   )

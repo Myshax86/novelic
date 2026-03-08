@@ -40,7 +40,7 @@ body {
 
 .app-grid {
   display: grid;
-  grid-template-columns: 300px 1fr 300px;
+  grid-template-columns: 300px 1fr;
   gap: 1rem;
   margin-top: 1rem;
 }
@@ -269,9 +269,12 @@ button:hover {
   display: flex;
   gap: 1rem;
   align-items: flex-start;
-  overflow: auto;
+  overflow-x: auto;
+  overflow-y: auto;
+  height: min(72vh, 620px);
   min-width: 100%;
   padding-right: 0.6rem;
+  overscroll-behavior: contain;
 }
 
 .anchor-content {

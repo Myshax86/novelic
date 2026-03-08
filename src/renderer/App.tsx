@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { NovelSelector, Sidebar, SyncedCursor, TimelinePanel } from './components';
+import { NovelSelector, Sidebar, TimelinePanel } from './components';
 import { useNovelStore } from './store/useNovelStore';
 
 export default function App() {
@@ -14,7 +14,7 @@ export default function App() {
     <div className="app-shell">
       <header className="app-header">
         <h1>Novelic</h1>
-        <p>Multi-timeline story planner with overlap cursor</p>
+        <p>Multi-timeline story planner</p>
       </header>
 
       <main className="app-grid">
@@ -29,10 +29,6 @@ export default function App() {
           ) : (
             <section className="panel empty-state">Create or select a novel to begin.</section>
           )}
-        </div>
-
-        <div className="right-column">
-          <SyncedCursor />
         </div>
       </main>
     </div>

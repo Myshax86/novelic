@@ -1,7 +1,13 @@
-import { useEffect, useMemo, useRef, useState, type MouseEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type MouseEvent, type UIEvent, type WheelEvent } from 'react';
 import { useNovelStore } from '../store/useNovelStore';
 
 const AXIS_HEIGHT = 720;
+const DEFAULT_VERTICAL_MAX = 1;
+const HORIZONTAL_EDGE_TRIGGER_PX = 52;
+const HORIZONTAL_MIN_BUFFER_PX = 72;
+const HORIZONTAL_GROWTH_FACTOR = 0.15;
+const HORIZONTAL_MAX_HEADROOM_FACTOR = 0.35;
+const HORIZONTAL_SHRINK_STEP_FACTOR = 0.2;
 const MAIN_TIMELINE_ID = '__main_timeline__';
 const MAIN_COLUMN_WIDTH = 240;
 const ENTITY_COLUMN_WIDTH = 210;
@@ -38,12 +44,14 @@ interface TimelineContextMenu {
     | { type: 'bubble-dependency'; id: string };
 }
 
-function clamp01(value: number): number {
-  return Math.max(0, Math.min(1, value));
+function clampPosition(value: number, maxPosition: number): number {
+  return Math.max(0, Math.min(maxPosition, value));
 }
 
 export function TimelinePanel() {
   const panelRef = useRef<HTMLElement | null>(null);
+  const boardRef = useRef<HTMLDivElement | null>(null);
+  const lastBoardScrollLeftRef = useRef(0);
   const lastHoverYearRef = useRef<number | null>(null);
 
   const timelines = useNovelStore((s) => s.timelines);
@@ -53,6 +61,7 @@ export function TimelinePanel() {
   const bubbleEventsByNovel = useNovelStore((s) => s.bubbleEventsByNovel);
   const eventDependenciesByNovel = useNovelStore((s) => s.eventDependenciesByNovel);
   const timelineColumnWidthsByNovel = useNovelStore((s) => s.timelineColumnWidthsByNovel);
+  const timelineVerticalMaxByNovel = useNovelStore((s) => s.timelineVerticalMaxByNovel);
 
   const addTimePoint = useNovelStore((s) => s.addTimePoint);
   const updateTimePoint = useNovelStore((s) => s.updateTimePoint);
@@ -70,6 +79,7 @@ export function TimelinePanel() {
   const setBubbleEventSide = useNovelStore((s) => s.setBubbleEventSide);
   const setTimelineColumnWidth = useNovelStore((s) => s.setTimelineColumnWidth);
   const reorderTimelines = useNovelStore((s) => s.reorderTimelines);
+  const ensureTimelineVerticalExtent = useNovelStore((s) => s.ensureTimelineVerticalExtent);
 
   const setCursor = useNovelStore((s) => s.setCursor);
 
@@ -93,6 +103,7 @@ export function TimelinePanel() {
   } | null>(null);
   const [contextMenu, setContextMenu] = useState<TimelineContextMenu | null>(null);
   const [warning, setWarning] = useState<string | null>(null);
+  const [virtualContentWidth, setVirtualContentWidth] = useState(0);
 
   const rawPoints = useMemo(() => {
     if (!currentNovel) return [];
@@ -197,11 +208,17 @@ export function TimelinePanel() {
     [columns]
   );
 
-  const positionToTop = (position: number) => clamp01(position) * AXIS_HEIGHT;
+  const verticalMax = currentNovel
+    ? timelineVerticalMaxByNovel[currentNovel.id] ?? DEFAULT_VERTICAL_MAX
+    : DEFAULT_VERTICAL_MAX;
+  const axisHeight = Math.max(AXIS_HEIGHT, Math.round(AXIS_HEIGHT * verticalMax));
+  const renderedContentWidth = Math.max(contentWidth, virtualContentWidth || contentWidth);
+
+  const positionToTop = (position: number) => clampPosition(position, verticalMax) * AXIS_HEIGHT;
   const bubblePosition = (event: { anchor_point_id: string; offset: number }) => {
     const anchor = pointById.get(event.anchor_point_id);
     if (!anchor) return 0;
-    return clamp01(anchor.position + event.offset);
+    return clampPosition(anchor.position + event.offset, verticalMax);
   };
 
   const bubbleMaxWidth = (eventBubble: { id: string; timeline_id: string; side: 'left' | 'right'; anchor_point_id: string; offset: number }) => {
@@ -232,7 +249,9 @@ export function TimelinePanel() {
   const createAtClick = (timelineId: string, event: MouseEvent<HTMLDivElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
     const y = event.clientY - rect.top;
-    const position = clamp01(y / AXIS_HEIGHT);
+    const requested = y / AXIS_HEIGHT;
+    const nextMax = ensureTimelineVerticalExtent(requested + 0.12);
+    const position = clampPosition(requested, nextMax);
     const x = event.clientX - rect.left;
 
     if (mode === 'point') {
@@ -268,6 +287,84 @@ export function TimelinePanel() {
     setBubbleEditor(null);
   };
 
+  useEffect(() => {
+    const board = boardRef.current;
+    if (!board) return;
+    const width = board.clientWidth;
+    setVirtualContentWidth((prev) => {
+      const cap = contentWidth + width;
+      const base = Math.max(contentWidth, contentWidth + HORIZONTAL_MIN_BUFFER_PX);
+      const seeded = prev > 0 ? prev : base;
+      return Math.max(contentWidth, Math.min(seeded, cap));
+    });
+  }, [contentWidth, currentNovel?.id]);
+
+  useEffect(() => {
+    const onResize = () => {
+      const board = boardRef.current;
+      if (!board) return;
+      const width = board.clientWidth;
+      setVirtualContentWidth((prev) => {
+        const cap = contentWidth + width;
+        if (prev <= 0) {
+          return Math.max(contentWidth, contentWidth + HORIZONTAL_MIN_BUFFER_PX);
+        }
+        return Math.max(contentWidth, Math.min(prev, cap));
+      });
+    };
+
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, [contentWidth]);
+
+  const updateHorizontalVirtualWidth = (scrollLeft: number, clientWidth: number) => {
+    setVirtualContentWidth((prev) => {
+      const current = Math.max(contentWidth, prev || contentWidth);
+      const maxHeadroomPx = Math.max(
+        HORIZONTAL_MIN_BUFFER_PX,
+        Math.round(clientWidth * HORIZONTAL_MAX_HEADROOM_FACTOR)
+      );
+      const cap = contentWidth + maxHeadroomPx;
+      let next = Math.max(contentWidth, Math.min(current, cap));
+      const nearRight = scrollLeft + clientWidth >= next - HORIZONTAL_EDGE_TRIGGER_PX;
+      if (nearRight && next < cap) {
+        const chunk = Math.max(36, Math.round(clientWidth * HORIZONTAL_GROWTH_FACTOR));
+        next = Math.min(cap, next + chunk);
+      }
+
+      const desired = Math.max(contentWidth + HORIZONTAL_MIN_BUFFER_PX, scrollLeft + clientWidth + HORIZONTAL_MIN_BUFFER_PX);
+      if (next > desired) {
+        const shrinkStep = Math.max(24, Math.round(clientWidth * HORIZONTAL_SHRINK_STEP_FACTOR));
+        next = Math.max(desired, next - shrinkStep);
+      }
+
+      return next;
+    });
+  };
+
+  const handleBoardScroll = (event: UIEvent<HTMLDivElement>) => {
+    const board = event.currentTarget;
+    const horizontalChanged = Math.abs(board.scrollLeft - lastBoardScrollLeftRef.current) > 0.5;
+    if (horizontalChanged) {
+      lastBoardScrollLeftRef.current = board.scrollLeft;
+      updateHorizontalVirtualWidth(board.scrollLeft, board.clientWidth);
+    }
+
+    const nearBottom = board.scrollTop + board.clientHeight >= axisHeight - 56;
+    if (nearBottom) {
+      const requestedPosition = (board.scrollTop + board.clientHeight) / AXIS_HEIGHT + 0.1;
+      ensureTimelineVerticalExtent(requestedPosition);
+    }
+  };
+
+  const handleBoardWheel = (event: WheelEvent<HTMLDivElement>) => {
+    if (event.deltaY <= 0) return;
+    const board = event.currentTarget;
+    const requestedPosition =
+      (board.scrollTop + board.clientHeight + Math.min(event.deltaY, 220)) / AXIS_HEIGHT + 0.08;
+    ensureTimelineVerticalExtent(requestedPosition);
+  };
+
   return (
     <section className="panel timeline-panel" ref={panelRef}>
       <h2>Timeline Anchors</h2>
@@ -292,9 +389,17 @@ export function TimelinePanel() {
       </p>
       {warning && <p className="timeline-warning">{warning}</p>}
 
-      <div className="anchor-board">
-        <div className="anchor-content" style={{ width: `${contentWidth}px` }}>
-          <svg className="connection-layer" width={contentWidth} height={AXIS_HEIGHT}>
+      <div
+        className="anchor-board"
+        ref={boardRef}
+        onScroll={handleBoardScroll}
+        onWheel={handleBoardWheel}
+      >
+        <div
+          className="anchor-content"
+          style={{ width: `${renderedContentWidth}px`, minHeight: `${axisHeight + 28}px` }}
+        >
+          <svg className="connection-layer" width={renderedContentWidth} height={axisHeight}>
             {pointConnections.map((connection) => {
               const from = pointById.get(connection.from_point_id);
               const to = pointById.get(connection.to_point_id);
@@ -423,11 +528,14 @@ export function TimelinePanel() {
                 </h3>
                 <div
                   className={`timeline-axis ${isMain ? 'main-axis' : 'entity-axis'}`}
+                  style={{ height: `${axisHeight}px` }}
                   onClick={(event) => createAtClick(column.id, event)}
                   onMouseMove={(event) => {
                     const rect = event.currentTarget.getBoundingClientRect();
                     const y = event.clientY - rect.top;
-                    const nextPosition = clamp01(y / AXIS_HEIGHT);
+                    const requested = y / AXIS_HEIGHT;
+                    const nextMax = ensureTimelineVerticalExtent(requested + 0.08);
+                    const nextPosition = clampPosition(requested, nextMax);
                     setHoverState({ timelineId: column.id, position: nextPosition });
                     const fakeYear = 1900 + Math.round(nextPosition * 200);
                     if (lastHoverYearRef.current !== fakeYear) {
@@ -478,7 +586,9 @@ export function TimelinePanel() {
                       onPointerMove={(e) => {
                         if (draggingPointId !== point.id) return;
                         const axis = (e.currentTarget.parentElement as HTMLDivElement).getBoundingClientRect();
-                        const nextPosition = clamp01((e.clientY - axis.top) / AXIS_HEIGHT);
+                        const requested = (e.clientY - axis.top) / AXIS_HEIGHT;
+                        const nextMax = ensureTimelineVerticalExtent(requested + 0.1);
+                        const nextPosition = clampPosition(requested, nextMax);
                         setHoverState({ timelineId: point.timeline_id, position: nextPosition });
                         updateTimePointPosition(point.id, nextPosition);
                       }}
@@ -562,7 +672,9 @@ export function TimelinePanel() {
                         onPointerMove={(e) => {
                           if (draggingBubbleId !== eventBubble.id) return;
                           const axis = (e.currentTarget.parentElement as HTMLDivElement).getBoundingClientRect();
-                          const nextPosition = clamp01((e.clientY - axis.top) / AXIS_HEIGHT);
+                          const requested = (e.clientY - axis.top) / AXIS_HEIGHT;
+                          const nextMax = ensureTimelineVerticalExtent(requested + 0.1);
+                          const nextPosition = clampPosition(requested, nextMax);
                           const side = e.clientX < axis.left + axis.width / 2 ? 'left' : 'right';
                           if (side !== eventBubble.side) {
                             setBubbleEventSide(eventBubble.id, side);
@@ -605,6 +717,9 @@ export function TimelinePanel() {
                         <span
                           className="bubble-dependency-handle"
                           draggable
+                          onPointerDown={(e) => {
+                            e.stopPropagation();
+                          }}
                           onDragStart={(e) => {
                             e.stopPropagation();
                             setDepDragFromEventId(eventBubble.id);

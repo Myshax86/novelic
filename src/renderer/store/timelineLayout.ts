@@ -48,6 +48,10 @@ const TIME_POINT_RADIUS_PX = 9;
 const TIME_POINT_VISIBLE_GAP_PX = 4;
 const TIME_POINT_MIN_GAP = 0.005;
 
+function clampPosition(value: number, maxPosition: number): number {
+  return Math.max(0, Math.min(maxPosition, value));
+}
+
 export function selectAnchorPoint(
   points: TimePoint[],
   timelineId: string,
@@ -106,11 +110,12 @@ export function canMoveBubbleEvent(
 export function desiredBubblePosition(
   event: TimelineBubbleEvent,
   desiredPosition: number,
-  points: TimePoint[]
+  points: TimePoint[],
+  maxPosition = 1
 ): TimelineBubbleEvent {
   const anchor = selectAnchorPoint(points, event.timeline_id, desiredPosition);
   if (!anchor) return event;
-  const clamped = Math.max(0, Math.min(1, desiredPosition));
+  const clamped = clampPosition(desiredPosition, maxPosition);
   return {
     ...event,
     anchor_point_id: anchor.id,
@@ -122,12 +127,13 @@ export function anchoredBubblePosition(
   event: TimelineBubbleEvent,
   desiredPosition: number,
   pointsById: Map<string, TimePoint>,
-  points: TimePoint[]
+  points: TimePoint[],
+  maxPosition = 1
 ): TimelineBubbleEvent {
   const anchor = pointsById.get(event.anchor_point_id);
-  const clamped = Math.max(0, Math.min(1, desiredPosition));
+  const clamped = clampPosition(desiredPosition, maxPosition);
   if (!anchor) {
-    return desiredBubblePosition(event, clamped, points);
+    return desiredBubblePosition(event, clamped, points, maxPosition);
   }
   return {
     ...event,
@@ -157,7 +163,8 @@ export function pointClearance(event: TimelineBubbleEvent): number {
 
 export function eventScopeBounds(
   event: TimelineBubbleEvent,
-  points: TimePoint[]
+  points: TimePoint[],
+  maxPosition = 1
 ): { min: number; max: number } {
   const timelinePoints = points
     .filter((point) => point.timeline_id === event.timeline_id)
@@ -165,7 +172,7 @@ export function eventScopeBounds(
 
   const anchorIndex = timelinePoints.findIndex((point) => point.id === event.anchor_point_id);
   if (anchorIndex < 0) {
-    return { min: 0, max: 1 };
+    return { min: 0, max: maxPosition };
   }
 
   const anchorPos = timelinePoints[anchorIndex].position;
@@ -181,7 +188,7 @@ export function eventScopeBounds(
   }
 
   const min = anchorPos + BASE_MIN_GAP;
-  const max = nextPoint ? nextPoint.position - BASE_MIN_GAP : 1;
+  const max = nextPoint ? nextPoint.position - BASE_MIN_GAP : maxPosition;
   return { min, max: Math.max(min, max) };
 }
 
@@ -189,7 +196,8 @@ export function slideTimelinePointsFromBubbles(
   timelinePoints: TimePoint[],
   timelineBubbles: TimelineBubbleEvent[],
   preferredBubbleId?: string,
-  preferredBubbleCenter?: number
+  preferredBubbleCenter?: number,
+  maxPosition = 1
 ): { nextPoints: TimePoint[]; deltas: Map<string, number> } {
   if (timelinePoints.length === 0 || timelineBubbles.length === 0) {
     return { nextPoints: timelinePoints, deltas: new Map<string, number>() };
@@ -219,7 +227,7 @@ export function slideTimelinePointsFromBubbles(
   for (let pass = 0; pass < 8; pass += 1) {
     for (let i = 0; i < projected.length; i += 1) {
       let lowerBound = 0;
-      let upperBound = 1;
+      let upperBound = maxPosition;
       const current = projected[i];
       let preferredDirection: 'up' | 'down' | null = null;
 
@@ -276,15 +284,15 @@ export function slideTimelinePointsFromBubbles(
       for (let i = 0; i < projected.length; i += 1) projected[i] += delta;
     }
     const last = projected.length - 1;
-    if (last >= 0 && projected[last] > 1) {
-      const delta = projected[last] - 1;
+    if (last >= 0 && projected[last] > maxPosition) {
+      const delta = projected[last] - maxPosition;
       for (let i = 0; i < projected.length; i += 1) projected[i] -= delta;
     }
   }
 
   const nextPoints = points.map((point, index) => ({
     ...point,
-    position: Math.max(0, Math.min(1, projected[index]))
+    position: clampPosition(projected[index], maxPosition)
   }));
 
   const deltas = new Map<string, number>();
@@ -301,7 +309,8 @@ export function slideTimelinePointsFromBubbles(
 export function alignConnectedPoints(
   originalPoints: TimePoint[],
   candidatePoints: TimePoint[],
-  connections: TimePointConnection[]
+  connections: TimePointConnection[],
+  maxPosition = 1
 ): TimePoint[] {
   const originalById = new Map(originalPoints.map((point) => [point.id, point]));
   const nextById = new Map(candidatePoints.map((point) => [point.id, point]));
@@ -352,7 +361,7 @@ export function alignConnectedPoints(
         movedDeltas.push(delta);
       }
       componentMinDelta = Math.max(componentMinDelta, -prev.position);
-      componentMaxDelta = Math.min(componentMaxDelta, 1 - prev.position);
+      componentMaxDelta = Math.min(componentMaxDelta, maxPosition - prev.position);
     });
 
     if (movedDeltas.length === 0) return;
@@ -385,7 +394,8 @@ export function enforceComponentPointClearance(
   points: TimePoint[],
   connections: TimePointConnection[],
   zones: BubbleZone[],
-  preferredBubbleId?: string
+  preferredBubbleId?: string,
+  maxPosition = 1
 ): TimePoint[] {
   if (points.length === 0 || zones.length === 0) return points;
 
@@ -453,7 +463,7 @@ export function enforceComponentPointClearance(
         const member = byId.get(id);
         if (!member) return;
         minShift = Math.max(minShift, -member.position);
-        maxShift = Math.min(maxShift, 1 - member.position);
+        maxShift = Math.min(maxShift, maxPosition - member.position);
       });
       const clampedShift = Math.max(minShift, Math.min(maxShift, requestedShift));
       if (Math.abs(clampedShift) < 0.000001) continue;
@@ -461,7 +471,7 @@ export function enforceComponentPointClearance(
       component.forEach((id) => {
         const member = byId.get(id);
         if (!member) return;
-        member.position = Math.max(0, Math.min(1, member.position + clampedShift));
+        member.position = clampPosition(member.position + clampedShift, maxPosition);
       });
       moved = true;
     }
@@ -478,13 +488,14 @@ export function resolveTimelineBubbleCollisions(
   _previousPosition: number,
   nextPosition: number,
   points: TimePoint[],
-  sideLockById?: Map<string, 'above' | 'below'>
+  sideLockById?: Map<string, 'above' | 'below'>,
+  maxPosition = 1
 ): TimelineBubbleEvent[] {
   const moving = timelineEvents.find((item) => item.id === movingEventId);
   if (!moving) return timelineEvents;
 
   const pointsById = new Map(points.map((point) => [point.id, point]));
-  const desired = Math.max(0, Math.min(1, nextPosition));
+  const desired = clampPosition(nextPosition, maxPosition);
 
   // Treat bubble movement like list insertion: neighbors shift by one slot, not runaway pushing.
   const ordered = [...timelineEvents].sort(
@@ -512,12 +523,12 @@ export function resolveTimelineBubbleCollisions(
     assigned.map((entry) => {
       if (entry.event.id === movingEventId) {
         // Direct user drag can cross scope; only auto-moved neighbors are side-constrained.
-        return [entry.event.id, { min: 0, max: 1 }] as const;
+        return [entry.event.id, { min: 0, max: maxPosition }] as const;
       }
 
       const lock = sideLockById?.get(entry.event.id);
       if (!lock) {
-        return [entry.event.id, eventScopeBounds(entry.event, points)] as const;
+        return [entry.event.id, eventScopeBounds(entry.event, points, maxPosition)] as const;
       }
 
       const proxyEvent: TimelineBubbleEvent = {
@@ -527,14 +538,14 @@ export function resolveTimelineBubbleCollisions(
             ? -Math.abs(entry.event.offset || BASE_MIN_GAP)
             : Math.abs(entry.event.offset || BASE_MIN_GAP)
       };
-      return [entry.event.id, eventScopeBounds(proxyEvent, points)] as const;
+      return [entry.event.id, eventScopeBounds(proxyEvent, points, maxPosition)] as const;
     })
   );
 
   // Iterative solver: keep spacing, but never push non-dragged bubbles outside their scope.
   for (let pass = 0; pass < 4; pass += 1) {
     for (let i = 0; i < assigned.length; i += 1) {
-      const bounds = boundsById.get(assigned[i].event.id) ?? { min: 0, max: 1 };
+      const bounds = boundsById.get(assigned[i].event.id) ?? { min: 0, max: maxPosition };
       assigned[i].pos = Math.max(bounds.min, Math.min(bounds.max, assigned[i].pos));
     }
 
@@ -554,7 +565,7 @@ export function resolveTimelineBubbleCollisions(
   }
 
   // Final placement for dragged bubble: nearest feasible slot if borders constrain neighbors.
-  const movingBounds = boundsById.get(movingEventId) ?? { min: 0, max: 1 };
+  const movingBounds = boundsById.get(movingEventId) ?? { min: 0, max: maxPosition };
   const prev = movingAssignedIndex > 0 ? assigned[movingAssignedIndex - 1] : null;
   const next =
     movingAssignedIndex < assigned.length - 1 ? assigned[movingAssignedIndex + 1] : null;
@@ -592,7 +603,10 @@ export function resolveTimelineBubbleCollisions(
 
   const nextById = new Map<string, TimelineBubbleEvent>();
   assigned.forEach((entry) => {
-    nextById.set(entry.event.id, anchoredBubblePosition(entry.event, entry.pos, pointsById, points));
+    nextById.set(
+      entry.event.id,
+      anchoredBubblePosition(entry.event, entry.pos, pointsById, points, maxPosition)
+    );
   });
 
   return timelineEvents.map((event) => nextById.get(event.id) ?? event);
