@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { v4 as uuidv4 } from 'uuid';
 import type {
+  Chapter,
   CreateEventInput,
   Novel,
   NovelPayload,
@@ -21,7 +22,6 @@ import {
   alignConnectedPoints,
   anchoredBubblePosition,
   bubblePosition,
-  canMoveBubbleEvent,
   desiredBubblePosition,
   enforceComponentPointClearance,
   eventScopeBounds,
@@ -40,6 +40,8 @@ import {
 interface NovelStore {
   novels: Novel[];
   currentNovel: Novel | null;
+  chapters: Chapter[];
+  currentChapter: Chapter | null;
   lastError: string | null;
   timelines: Timeline[];
   events: TimelineEvent[];
@@ -54,10 +56,16 @@ interface NovelStore {
   eventDependenciesByNovel: Record<string, TimelineEventDependency[]>;
   timelineColumnWidthsByNovel: Record<string, Record<string, number>>;
   timelineVerticalMaxByNovel: Record<string, number>;
+  layout_undo_history: LayoutSnapshot[];
+  layout_undo_index: number;
   clearError: () => void;
   initialize: () => Promise<void>;
   createNovel: (name: string) => Promise<void>;
   selectNovel: (novelId: string) => Promise<void>;
+  selectChapter: (chapterId: string) => Promise<void>;
+  createChapter: (name: string) => Promise<void>;
+  renameChapter: (chapterId: string, name: string) => Promise<void>;
+  deleteChapter: (chapterId: string) => Promise<void>;
   createTimeline: (name: string, color: string) => Promise<void>;
   updateTimelineColor: (timelineId: string, color: string) => Promise<void>;
   updateTimelineName: (timelineId: string, name: string) => Promise<void>;
@@ -85,13 +93,25 @@ interface NovelStore {
   addEventDependency: (fromEventId: string, toEventId: string) => boolean;
   deleteEventDependency: (dependencyId: string) => void;
   setBubbleEventSide: (eventId: string, side: BubbleSide) => void;
+  repairCollapsedBubbleEvents: () => boolean;
   setTimelineColumnWidth: (timelineId: string, width: number) => void;
   ensureTimelineVerticalExtent: (requestedPosition: number) => number;
+  captureLayoutSnapshot: () => void;
   reorderTimelines: (
     sourceTimelineId: string,
     targetTimelineId: string,
     dropPosition: 'before' | 'after'
   ) => Promise<void>;
+}
+
+interface LayoutSnapshot {
+  scopeKey: string;
+  points: TimePoint[];
+  connections: TimePointConnection[];
+  bubbles: TimelineBubbleEvent[];
+  dependencies: TimelineEventDependency[];
+  columnWidths: Record<string, number>;
+  verticalMax: number;
 }
 
 const CURSOR_QUERY_DEBOUNCE_MS = 80;
@@ -100,6 +120,7 @@ const VERTICAL_EDGE_GROWTH_CHUNK = 0.25;
 const VERTICAL_HEADROOM_VIEWPORTS = 1;
 const VERTICAL_MIN_FORWARD_BUFFER = 0.2;
 const VERTICAL_MAX_HARD_LIMIT = 24;
+const MAX_LAYOUT_UNDO = 80;
 
 let cursorQueryTimer: number | null = null;
 let cursorQueryToken = 0;
@@ -123,6 +144,67 @@ function clampPosition(value: number, maxPosition: number): number {
   return Math.max(0, Math.min(maxPosition, value));
 }
 
+function chapterScopeKey(novelId: string, chapterId: string | null): string {
+  return `${novelId}::${chapterId ?? '__no_chapter__'}`;
+}
+
+function currentLayoutScopeKey(state: Pick<NovelStore, 'currentNovel' | 'currentChapter'>): string | null {
+  if (!state.currentNovel) return null;
+  return chapterScopeKey(state.currentNovel.id, state.currentChapter?.id ?? null);
+}
+
+function chapterScopedState(payload: NovelPayload, preferredChapterId: string | null) {
+  if (payload.chapters.length === 0) {
+    return {
+      chapter: null,
+      timelines: [] as Timeline[],
+      events: [] as TimelineEvent[]
+    };
+  }
+
+  const chapter = payload.chapters.find((item) => item.id === preferredChapterId) ?? payload.chapters[0];
+  const timelines = payload.timelines.filter((timeline) => timeline.chapter_id === chapter.id);
+  const timelineIds = new Set(timelines.map((timeline) => timeline.id));
+  const events = payload.events.filter((event) => timelineIds.has(event.timeline_id));
+  return { chapter, timelines, events };
+}
+
+function migrateLegacyLayoutScope(state: NovelStore, novelId: string, chapterId: string | null) {
+  if (!chapterId) {
+    return {
+      timePointsByNovel: state.timePointsByNovel,
+      timePointConnectionsByNovel: state.timePointConnectionsByNovel,
+      bubbleEventsByNovel: state.bubbleEventsByNovel,
+      eventDependenciesByNovel: state.eventDependenciesByNovel,
+      timelineColumnWidthsByNovel: state.timelineColumnWidthsByNovel,
+      timelineVerticalMaxByNovel: state.timelineVerticalMaxByNovel
+    };
+  }
+
+  const legacyKey = novelId;
+  const scopedKey = chapterScopeKey(novelId, chapterId);
+
+  const migrateRecord = <T,>(record: Record<string, T>): Record<string, T> => {
+    if (record[scopedKey] || !record[legacyKey]) {
+      return record;
+    }
+    const { [legacyKey]: legacyValue, ...rest } = record;
+    return {
+      ...rest,
+      [scopedKey]: legacyValue
+    };
+  };
+
+  return {
+    timePointsByNovel: migrateRecord(state.timePointsByNovel),
+    timePointConnectionsByNovel: migrateRecord(state.timePointConnectionsByNovel),
+    bubbleEventsByNovel: migrateRecord(state.bubbleEventsByNovel),
+    eventDependenciesByNovel: migrateRecord(state.eventDependenciesByNovel),
+    timelineColumnWidthsByNovel: migrateRecord(state.timelineColumnWidthsByNovel),
+    timelineVerticalMaxByNovel: migrateRecord(state.timelineVerticalMaxByNovel)
+  };
+}
+
 function timelineContentMaxPosition(points: TimePoint[], bubbles: TimelineBubbleEvent[]): number {
   const pointsById = new Map(points.map((point) => [point.id, point]));
   let maxPosition = DEFAULT_TIMELINE_VERTICAL_MAX;
@@ -143,6 +225,146 @@ function timelineContentMaxPosition(points: TimePoint[], bubbles: TimelineBubble
   return maxPosition;
 }
 
+function cloneLayoutSnapshot(snapshot: LayoutSnapshot): LayoutSnapshot {
+  return {
+    scopeKey: snapshot.scopeKey,
+    points: snapshot.points.map((point) => ({ ...point })),
+    connections: snapshot.connections.map((connection) => ({ ...connection })),
+    bubbles: snapshot.bubbles.map((bubble) => ({ ...bubble })),
+    dependencies: snapshot.dependencies.map((dep) => ({ ...dep })),
+    columnWidths: { ...snapshot.columnWidths },
+    verticalMax: snapshot.verticalMax
+  };
+}
+
+function buildLayoutSnapshot(state: NovelStore): LayoutSnapshot | null {
+  const scopeKey = currentLayoutScopeKey(state);
+  if (!scopeKey) return null;
+  return {
+    scopeKey,
+    points: (state.timePointsByNovel[scopeKey] ?? []).map((point) => ({ ...point })),
+    connections: (state.timePointConnectionsByNovel[scopeKey] ?? []).map((connection) => ({ ...connection })),
+    bubbles: (state.bubbleEventsByNovel[scopeKey] ?? []).map((bubble) => ({ ...bubble })),
+    dependencies: (state.eventDependenciesByNovel[scopeKey] ?? []).map((dep) => ({ ...dep })),
+    columnWidths: { ...(state.timelineColumnWidthsByNovel[scopeKey] ?? {}) },
+    verticalMax: state.timelineVerticalMaxByNovel[scopeKey] ?? DEFAULT_TIMELINE_VERTICAL_MAX
+  };
+}
+
+function sameLayoutSnapshot(a: LayoutSnapshot, b: LayoutSnapshot): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function connectedDependencyEventIds(
+  eventId: string,
+  deps: TimelineEventDependency[],
+  events: TimelineBubbleEvent[],
+  edgeFilter?: (from: TimelineBubbleEvent, to: TimelineBubbleEvent, dep: TimelineEventDependency) => boolean
+): Set<string> {
+  const adjacency = new Map<string, Set<string>>();
+  const eventById = new Map(events.map((event) => [event.id, event]));
+
+  const link = (a: string, b: string) => {
+    if (!adjacency.has(a)) adjacency.set(a, new Set<string>());
+    adjacency.get(a)?.add(b);
+  };
+
+  deps.forEach((dep) => {
+    const from = eventById.get(dep.from_event_id);
+    const to = eventById.get(dep.to_event_id);
+    if (!from || !to) return;
+    if (edgeFilter && !edgeFilter(from, to, dep)) return;
+    link(dep.from_event_id, dep.to_event_id);
+    link(dep.to_event_id, dep.from_event_id);
+  });
+
+  const visited = new Set<string>([eventId]);
+  const queue = [eventId];
+  while (queue.length > 0) {
+    const current = queue.shift() as string;
+    const neighbors = adjacency.get(current);
+    if (!neighbors) continue;
+    neighbors.forEach((neighbor) => {
+      if (visited.has(neighbor)) return;
+      visited.add(neighbor);
+      queue.push(neighbor);
+    });
+  }
+
+  return visited;
+}
+
+function connectedHorizontalDependencyEventIds(
+  eventId: string,
+  deps: TimelineEventDependency[],
+  events: TimelineBubbleEvent[]
+): Set<string> {
+  return connectedDependencyEventIds(
+    eventId,
+    deps,
+    events,
+    (from, to) => from.timeline_id !== to.timeline_id
+  );
+}
+
+function spreadCoincidentEvents(
+  events: TimelineBubbleEvent[],
+  points: TimePoint[],
+  maxPosition: number,
+  candidateIds?: Set<string>
+): TimelineBubbleEvent[] {
+  if (events.length < 2) return events;
+
+  const pointsById = new Map(points.map((point) => [point.id, point]));
+  const byTimeline = new Map<string, TimelineBubbleEvent[]>();
+
+  events.forEach((event) => {
+    if (candidateIds && !candidateIds.has(event.id)) return;
+    const bucket = byTimeline.get(event.timeline_id) ?? [];
+    bucket.push(event);
+    byTimeline.set(event.timeline_id, bucket);
+  });
+
+  const nextById = new Map<string, TimelineBubbleEvent>();
+
+  byTimeline.forEach((timelineEvents) => {
+    if (timelineEvents.length < 2) return;
+
+    const sorted = [...timelineEvents].sort((a, b) => {
+      const aPos = bubblePosition(a, pointsById);
+      const bPos = bubblePosition(b, pointsById);
+      if (Math.abs(aPos - bPos) > 0.000001) return aPos - bPos;
+      return a.id.localeCompare(b.id);
+    });
+
+    let index = 0;
+    while (index < sorted.length) {
+      const run = [sorted[index]];
+      const basePos = bubblePosition(sorted[index], pointsById);
+      let cursor = index + 1;
+      while (cursor < sorted.length) {
+        const nextPos = bubblePosition(sorted[cursor], pointsById);
+        if (Math.abs(nextPos - basePos) > 0.000001) break;
+        run.push(sorted[cursor]);
+        cursor += 1;
+      }
+
+      if (run.length > 1) {
+        const start = basePos - ((run.length - 1) * BASE_MIN_GAP) / 2;
+        run.forEach((event, offsetIndex) => {
+          const desired = clampPosition(start + offsetIndex * BASE_MIN_GAP, maxPosition);
+          nextById.set(event.id, anchoredBubblePosition(event, desired, pointsById, points, maxPosition));
+        });
+      }
+
+      index = cursor;
+    }
+  });
+
+  if (nextById.size === 0) return events;
+  return events.map((event) => nextById.get(event.id) ?? event);
+}
+
 async function pushSnapshotToDb(snapshot: LocalSnapshot): Promise<void> {
   await novelApi.createSnapshot(snapshot.novel.id, serializeSnapshot(snapshot));
 }
@@ -152,6 +374,8 @@ export const useNovelStore = create<NovelStore>()(
     (set, get) => ({
       novels: [],
       currentNovel: null,
+      chapters: [],
+      currentChapter: null,
       lastError: null,
       timelines: [],
       events: [],
@@ -166,8 +390,29 @@ export const useNovelStore = create<NovelStore>()(
       eventDependenciesByNovel: {},
       timelineColumnWidthsByNovel: {},
       timelineVerticalMaxByNovel: {},
+      layout_undo_history: [],
+      layout_undo_index: -1,
 
       clearError: () => set({ lastError: null }),
+
+      captureLayoutSnapshot: () => {
+        set((state) => {
+          const snapshot = buildLayoutSnapshot(state);
+          if (!snapshot) return {};
+
+          const base = state.layout_undo_history.slice(0, state.layout_undo_index + 1);
+          const previous = base[base.length - 1];
+          if (previous && sameLayoutSnapshot(previous, snapshot)) {
+            return {};
+          }
+
+          const nextHistory = [...base, cloneLayoutSnapshot(snapshot)].slice(-MAX_LAYOUT_UNDO);
+          return {
+            layout_undo_history: nextHistory,
+            layout_undo_index: nextHistory.length - 1
+          };
+        });
+      },
 
       initialize: async () => {
         set({ lastError: null });
@@ -179,6 +424,8 @@ export const useNovelStore = create<NovelStore>()(
             set({
               novels: [],
               currentNovel: null,
+              chapters: [],
+              currentChapter: null,
               timelines: [],
               events: [],
               timePointsByNovel: {},
@@ -214,15 +461,130 @@ export const useNovelStore = create<NovelStore>()(
         try {
           resetCursorQueryState();
           const payload: NovelPayload = await novelApi.getNovelPayload(novelId);
+          const scoped = chapterScopedState(payload, null);
+          set((state) => {
+            const migrated = migrateLegacyLayoutScope(state, payload.novel.id, scoped.chapter?.id ?? null);
+            return {
+              ...migrated,
+              currentNovel: payload.novel,
+              chapters: payload.chapters,
+              currentChapter: scoped.chapter,
+              timelines: scoped.timelines,
+              events: scoped.events,
+              selectedCursor: null,
+              overlappingEvents: [],
+              undo_history: [snapshotFromPayload(payload, scoped.chapter?.id ?? null)],
+              undo_index: 0,
+              layout_undo_history: [],
+              layout_undo_index: -1
+            };
+          });
+        } catch (error) {
+          set({ lastError: toErrorMessage(error) });
+        }
+      },
+
+      selectChapter: async (chapterId: string) => {
+        set({ lastError: null });
+        try {
+          const { currentNovel } = get();
+          if (!currentNovel) return;
+
+          resetCursorQueryState();
+          const payload: NovelPayload = await novelApi.getNovelPayload(currentNovel.id);
+          const scoped = chapterScopedState(payload, chapterId);
           set({
-            currentNovel: payload.novel,
-            timelines: payload.timelines,
-            events: payload.events,
+            chapters: payload.chapters,
+            currentChapter: scoped.chapter,
+            timelines: scoped.timelines,
+            events: scoped.events,
+            selectedCursor: null,
+            overlappingEvents: []
+          });
+        } catch (error) {
+          set({ lastError: toErrorMessage(error) });
+        }
+      },
+
+      createChapter: async (name: string) => {
+        set({ lastError: null });
+        try {
+          const { currentNovel, undo_history, undo_index } = get();
+          if (!currentNovel) return;
+
+          const created = await novelApi.createChapter({ novel_id: currentNovel.id, name: name.trim() });
+          const payload: NovelPayload = await novelApi.getNovelPayload(currentNovel.id);
+          const scoped = chapterScopedState(payload, created.id);
+          const snapshot = snapshotFromPayload(payload, scoped.chapter?.id ?? null);
+          const bounded = appendHistory(undo_history, undo_index, snapshot);
+
+          set({
+            chapters: payload.chapters,
+            currentChapter: scoped.chapter,
+            timelines: scoped.timelines,
+            events: scoped.events,
+            undo_history: bounded,
+            undo_index: bounded.length - 1
+          });
+          await pushSnapshotToDb(snapshot);
+        } catch (error) {
+          set({ lastError: toErrorMessage(error) });
+        }
+      },
+
+      renameChapter: async (chapterId: string, name: string) => {
+        set({ lastError: null });
+        try {
+          const { currentNovel, currentChapter, undo_history, undo_index } = get();
+          if (!currentNovel) return;
+          const trimmed = name.trim();
+          if (!trimmed) return;
+
+          await novelApi.updateChapter({ id: chapterId, novel_id: currentNovel.id, name: trimmed });
+          const payload: NovelPayload = await novelApi.getNovelPayload(currentNovel.id);
+          const scoped = chapterScopedState(payload, currentChapter?.id ?? null);
+          const snapshot = snapshotFromPayload(payload, scoped.chapter?.id ?? null);
+          const bounded = appendHistory(undo_history, undo_index, snapshot);
+
+          set({
+            chapters: payload.chapters,
+            currentChapter: scoped.chapter,
+            timelines: scoped.timelines,
+            events: scoped.events,
+            undo_history: bounded,
+            undo_index: bounded.length - 1
+          });
+          await pushSnapshotToDb(snapshot);
+        } catch (error) {
+          set({ lastError: toErrorMessage(error) });
+        }
+      },
+
+      deleteChapter: async (chapterId: string) => {
+        set({ lastError: null });
+        try {
+          const { currentNovel, currentChapter, undo_history, undo_index } = get();
+          if (!currentNovel) return;
+
+          await novelApi.deleteChapter(chapterId);
+          const payload: NovelPayload = await novelApi.getNovelPayload(currentNovel.id);
+          const nextPreferred = currentChapter?.id === chapterId ? null : currentChapter?.id ?? null;
+          const scoped = chapterScopedState(payload, nextPreferred);
+          const snapshot = snapshotFromPayload(payload, scoped.chapter?.id ?? null);
+          const bounded = appendHistory(undo_history, undo_index, snapshot);
+
+          resetCursorQueryState();
+          set({
+            chapters: payload.chapters,
+            currentChapter: scoped.chapter,
+            timelines: scoped.timelines,
+            events: scoped.events,
             selectedCursor: null,
             overlappingEvents: [],
-            undo_history: [snapshotFromPayload(payload)],
-            undo_index: 0
+            undo_history: bounded,
+            undo_index: bounded.length - 1
           });
+          await pushSnapshotToDb(snapshot);
         } catch (error) {
           set({ lastError: toErrorMessage(error) });
         }
@@ -231,18 +593,26 @@ export const useNovelStore = create<NovelStore>()(
       createTimeline: async (name, color) => {
         set({ lastError: null });
         try {
-          const { currentNovel } = get();
-          if (!currentNovel) return;
+          const { currentNovel, currentChapter } = get();
+          if (!currentNovel || !currentChapter) return;
 
-          await novelApi.createTimeline({ novel_id: currentNovel.id, name, color });
+          await novelApi.createTimeline({
+            novel_id: currentNovel.id,
+            chapter_id: currentChapter.id,
+            name,
+            color
+          });
           const payload: NovelPayload = await novelApi.getNovelPayload(currentNovel.id);
           const state = get();
-          const snapshot = snapshotFromPayload(payload);
+          const scoped = chapterScopedState(payload, currentChapter.id);
+          const snapshot = snapshotFromPayload(payload, scoped.chapter?.id ?? null);
           const bounded = appendHistory(state.undo_history, state.undo_index, snapshot);
 
           set({
-            timelines: payload.timelines,
-            events: payload.events,
+            chapters: payload.chapters,
+            currentChapter: scoped.chapter,
+            timelines: scoped.timelines,
+            events: scoped.events,
             undo_history: bounded,
             undo_index: bounded.length - 1
           });
@@ -264,12 +634,15 @@ export const useNovelStore = create<NovelStore>()(
           await novelApi.updateTimeline({ ...timeline, color });
           const payload: NovelPayload = await novelApi.getNovelPayload(currentNovel.id);
           const state = get();
-          const snapshot = snapshotFromPayload(payload);
+          const scoped = chapterScopedState(payload, state.currentChapter?.id ?? null);
+          const snapshot = snapshotFromPayload(payload, scoped.chapter?.id ?? null);
           const bounded = appendHistory(state.undo_history, state.undo_index, snapshot);
 
           set({
-            timelines: payload.timelines,
-            events: payload.events,
+            chapters: payload.chapters,
+            currentChapter: scoped.chapter,
+            timelines: scoped.timelines,
+            events: scoped.events,
             undo_history: bounded,
             undo_index: bounded.length - 1
           });
@@ -293,12 +666,15 @@ export const useNovelStore = create<NovelStore>()(
           await novelApi.updateTimeline({ ...timeline, name: trimmed });
           const payload: NovelPayload = await novelApi.getNovelPayload(currentNovel.id);
           const state = get();
-          const snapshot = snapshotFromPayload(payload);
+          const scoped = chapterScopedState(payload, state.currentChapter?.id ?? null);
+          const snapshot = snapshotFromPayload(payload, scoped.chapter?.id ?? null);
           const bounded = appendHistory(state.undo_history, state.undo_index, snapshot);
 
           set({
-            timelines: payload.timelines,
-            events: payload.events,
+            chapters: payload.chapters,
+            currentChapter: scoped.chapter,
+            timelines: scoped.timelines,
+            events: scoped.events,
             undo_history: bounded,
             undo_index: bounded.length - 1
           });
@@ -317,10 +693,18 @@ export const useNovelStore = create<NovelStore>()(
           await novelApi.createEvent({ ...input, novel_id: currentNovel.id });
           const payload: NovelPayload = await novelApi.getNovelPayload(currentNovel.id);
           const state = get();
-          const snapshot = snapshotFromPayload(payload);
+          const scoped = chapterScopedState(payload, state.currentChapter?.id ?? null);
+          const snapshot = snapshotFromPayload(payload, scoped.chapter?.id ?? null);
           const bounded = appendHistory(state.undo_history, state.undo_index, snapshot);
 
-          set({ timelines: payload.timelines, events: payload.events, undo_history: bounded, undo_index: bounded.length - 1 });
+          set({
+            chapters: payload.chapters,
+            currentChapter: scoped.chapter,
+            timelines: scoped.timelines,
+            events: scoped.events,
+            undo_history: bounded,
+            undo_index: bounded.length - 1
+          });
           await pushSnapshotToDb(snapshot);
         } catch (error) {
           set({ lastError: toErrorMessage(error) });
@@ -336,10 +720,18 @@ export const useNovelStore = create<NovelStore>()(
           await novelApi.updateEvent(input);
           const payload: NovelPayload = await novelApi.getNovelPayload(currentNovel.id);
           const state = get();
-          const snapshot = snapshotFromPayload(payload);
+          const scoped = chapterScopedState(payload, state.currentChapter?.id ?? null);
+          const snapshot = snapshotFromPayload(payload, scoped.chapter?.id ?? null);
           const bounded = appendHistory(state.undo_history, state.undo_index, snapshot);
 
-          set({ timelines: payload.timelines, events: payload.events, undo_history: bounded, undo_index: bounded.length - 1 });
+          set({
+            chapters: payload.chapters,
+            currentChapter: scoped.chapter,
+            timelines: scoped.timelines,
+            events: scoped.events,
+            undo_history: bounded,
+            undo_index: bounded.length - 1
+          });
           await pushSnapshotToDb(snapshot);
         } catch (error) {
           set({ lastError: toErrorMessage(error) });
@@ -355,10 +747,18 @@ export const useNovelStore = create<NovelStore>()(
           await novelApi.deleteEvent(eventId);
           const payload: NovelPayload = await novelApi.getNovelPayload(currentNovel.id);
           const state = get();
-          const snapshot = snapshotFromPayload(payload);
+          const scoped = chapterScopedState(payload, state.currentChapter?.id ?? null);
+          const snapshot = snapshotFromPayload(payload, scoped.chapter?.id ?? null);
           const bounded = appendHistory(state.undo_history, state.undo_index, snapshot);
 
-          set({ timelines: payload.timelines, events: payload.events, undo_history: bounded, undo_index: bounded.length - 1 });
+          set({
+            chapters: payload.chapters,
+            currentChapter: scoped.chapter,
+            timelines: scoped.timelines,
+            events: scoped.events,
+            undo_history: bounded,
+            undo_index: bounded.length - 1
+          });
           await pushSnapshotToDb(snapshot);
         } catch (error) {
           set({ lastError: toErrorMessage(error) });
@@ -374,12 +774,15 @@ export const useNovelStore = create<NovelStore>()(
           await novelApi.deleteTimeline(timelineId);
           const payload: NovelPayload = await novelApi.getNovelPayload(currentNovel.id);
           const state = get();
-          const snapshot = snapshotFromPayload(payload);
+          const scoped = chapterScopedState(payload, state.currentChapter?.id ?? null);
+          const snapshot = snapshotFromPayload(payload, scoped.chapter?.id ?? null);
           const bounded = appendHistory(state.undo_history, state.undo_index, snapshot);
 
           set({
-            timelines: payload.timelines,
-            events: payload.events,
+            chapters: payload.chapters,
+            currentChapter: scoped.chapter,
+            timelines: scoped.timelines,
+            events: scoped.events,
             undo_history: bounded,
             undo_index: bounded.length - 1
           });
@@ -390,7 +793,7 @@ export const useNovelStore = create<NovelStore>()(
       },
 
       setCursor: async (cursorIso) => {
-        const { currentNovel } = get();
+        const { currentNovel, currentChapter } = get();
         if (!currentNovel || !cursorIso) {
           resetCursorQueryState();
           set({ selectedCursor: cursorIso, overlappingEvents: [] });
@@ -407,7 +810,11 @@ export const useNovelStore = create<NovelStore>()(
 
         cursorQueryTimer = window.setTimeout(async () => {
           try {
-            const overlaps = await novelApi.getOverlappingEvents(currentNovel.id, cursorIso);
+            const overlaps = await novelApi.getOverlappingEvents(
+              currentNovel.id,
+              cursorIso,
+              currentChapter?.id
+            );
             const state = get();
             if (
               cursorQueryToken !== requestToken ||
@@ -430,6 +837,40 @@ export const useNovelStore = create<NovelStore>()(
       undo: async () => {
         set({ lastError: null });
         try {
+          const layoutState = get();
+          if (layoutState.layout_undo_index > 0) {
+            const nextIndex = layoutState.layout_undo_index - 1;
+            const snapshot = layoutState.layout_undo_history[nextIndex];
+            set((state) => ({
+              timePointsByNovel: {
+                ...state.timePointsByNovel,
+                [snapshot.scopeKey]: snapshot.points.map((point) => ({ ...point }))
+              },
+              timePointConnectionsByNovel: {
+                ...state.timePointConnectionsByNovel,
+                [snapshot.scopeKey]: snapshot.connections.map((connection) => ({ ...connection }))
+              },
+              bubbleEventsByNovel: {
+                ...state.bubbleEventsByNovel,
+                [snapshot.scopeKey]: snapshot.bubbles.map((bubble) => ({ ...bubble }))
+              },
+              eventDependenciesByNovel: {
+                ...state.eventDependenciesByNovel,
+                [snapshot.scopeKey]: snapshot.dependencies.map((dep) => ({ ...dep }))
+              },
+              timelineColumnWidthsByNovel: {
+                ...state.timelineColumnWidthsByNovel,
+                [snapshot.scopeKey]: { ...snapshot.columnWidths }
+              },
+              timelineVerticalMaxByNovel: {
+                ...state.timelineVerticalMaxByNovel,
+                [snapshot.scopeKey]: snapshot.verticalMax
+              },
+              layout_undo_index: nextIndex
+            }));
+            return;
+          }
+
           const { undo_index, undo_history, currentNovel } = get();
           if (!currentNovel || undo_index <= 0) return;
 
@@ -437,15 +878,19 @@ export const useNovelStore = create<NovelStore>()(
           const snapshot = undo_history[nextIndex];
           const payload: NovelPayload = {
             novel: snapshot.novel,
+            chapters: snapshot.chapters,
             timelines: snapshot.timelines,
             events: snapshot.events
           };
 
           await novelApi.replacePayload(payload);
+          const scoped = chapterScopedState(payload, snapshot.currentChapterId);
           set({
             currentNovel: payload.novel,
-            timelines: payload.timelines,
-            events: payload.events,
+            chapters: payload.chapters,
+            currentChapter: scoped.chapter,
+            timelines: scoped.timelines,
+            events: scoped.events,
             undo_index: nextIndex
           });
         } catch (error) {
@@ -456,6 +901,40 @@ export const useNovelStore = create<NovelStore>()(
       redo: async () => {
         set({ lastError: null });
         try {
+          const layoutState = get();
+          if (layoutState.layout_undo_index >= 0 && layoutState.layout_undo_index < layoutState.layout_undo_history.length - 1) {
+            const nextIndex = layoutState.layout_undo_index + 1;
+            const snapshot = layoutState.layout_undo_history[nextIndex];
+            set((state) => ({
+              timePointsByNovel: {
+                ...state.timePointsByNovel,
+                [snapshot.scopeKey]: snapshot.points.map((point) => ({ ...point }))
+              },
+              timePointConnectionsByNovel: {
+                ...state.timePointConnectionsByNovel,
+                [snapshot.scopeKey]: snapshot.connections.map((connection) => ({ ...connection }))
+              },
+              bubbleEventsByNovel: {
+                ...state.bubbleEventsByNovel,
+                [snapshot.scopeKey]: snapshot.bubbles.map((bubble) => ({ ...bubble }))
+              },
+              eventDependenciesByNovel: {
+                ...state.eventDependenciesByNovel,
+                [snapshot.scopeKey]: snapshot.dependencies.map((dep) => ({ ...dep }))
+              },
+              timelineColumnWidthsByNovel: {
+                ...state.timelineColumnWidthsByNovel,
+                [snapshot.scopeKey]: { ...snapshot.columnWidths }
+              },
+              timelineVerticalMaxByNovel: {
+                ...state.timelineVerticalMaxByNovel,
+                [snapshot.scopeKey]: snapshot.verticalMax
+              },
+              layout_undo_index: nextIndex
+            }));
+            return;
+          }
+
           const { undo_index, undo_history, currentNovel } = get();
           if (!currentNovel || undo_index >= undo_history.length - 1) return;
 
@@ -463,16 +942,20 @@ export const useNovelStore = create<NovelStore>()(
           const snapshot = undo_history[nextIndex];
           const payload: NovelPayload = {
             novel: snapshot.novel,
+            chapters: snapshot.chapters,
             timelines: snapshot.timelines,
             events: snapshot.events
           };
 
           await novelApi.replacePayload(payload);
+          const scoped = chapterScopedState(payload, snapshot.currentChapterId);
 
           set({
             currentNovel: payload.novel,
-            timelines: payload.timelines,
-            events: payload.events,
+            chapters: payload.chapters,
+            currentChapter: scoped.chapter,
+            timelines: scoped.timelines,
+            events: scoped.events,
             undo_index: nextIndex
           });
         } catch (error) {
@@ -516,11 +999,11 @@ export const useNovelStore = create<NovelStore>()(
       },
 
       addTimePoint: (label, position, timelineId) => {
-        const novelId = get().currentNovel?.id;
-        if (!novelId) return;
+        const scopeKey = currentLayoutScopeKey(get());
+        if (!scopeKey) return;
         const verticalMax =
-          get().timelineVerticalMaxByNovel[novelId] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
-        const existing = get().timePointsByNovel[novelId] ?? [];
+          get().timelineVerticalMaxByNovel[scopeKey] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
+        const existing = get().timePointsByNovel[scopeKey] ?? [];
         const point: TimePoint = {
           id: uuidv4(),
           label: label.trim(),
@@ -531,32 +1014,32 @@ export const useNovelStore = create<NovelStore>()(
         set({
           timePointsByNovel: {
             ...get().timePointsByNovel,
-            [novelId]: next
+            [scopeKey]: next
           }
         });
       },
 
       updateTimePoint: (id, label) => {
-        const novelId = get().currentNovel?.id;
-        if (!novelId) return;
-        const existing = get().timePointsByNovel[novelId] ?? [];
+        const scopeKey = currentLayoutScopeKey(get());
+        if (!scopeKey) return;
+        const existing = get().timePointsByNovel[scopeKey] ?? [];
         const next = existing.map((point) => (point.id === id ? { ...point, label: label.trim() } : point));
         set({
           timePointsByNovel: {
             ...get().timePointsByNovel,
-            [novelId]: next
+            [scopeKey]: next
           }
         });
       },
 
       updateTimePointPosition: (id, position) => {
-        const novelId = get().currentNovel?.id;
-        if (!novelId) return;
-        const existing = get().timePointsByNovel[novelId] ?? [];
+        const scopeKey = currentLayoutScopeKey(get());
+        if (!scopeKey) return;
+        const existing = get().timePointsByNovel[scopeKey] ?? [];
         const verticalMax =
-          get().timelineVerticalMaxByNovel[novelId] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
+          get().timelineVerticalMaxByNovel[scopeKey] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
         const clamped = clampPosition(position, verticalMax);
-        const connections = get().timePointConnectionsByNovel[novelId] ?? [];
+        const connections = get().timePointConnectionsByNovel[scopeKey] ?? [];
 
         // Move all points in the connected component so linked points stay horizontally aligned.
         const linkedIds = new Set<string>([id]);
@@ -583,22 +1066,22 @@ export const useNovelStore = create<NovelStore>()(
         set({
           timePointsByNovel: {
             ...get().timePointsByNovel,
-            [novelId]: next
+            [scopeKey]: next
           }
         });
       },
 
       deleteTimePoint: (id) => {
-        const novelId = get().currentNovel?.id;
-        if (!novelId) return;
-        const existing = get().timePointsByNovel[novelId] ?? [];
+        const scopeKey = currentLayoutScopeKey(get());
+        if (!scopeKey) return;
+        const existing = get().timePointsByNovel[scopeKey] ?? [];
         const next = existing.filter((point) => point.id !== id);
-        const connections = get().timePointConnectionsByNovel[novelId] ?? [];
+        const connections = get().timePointConnectionsByNovel[scopeKey] ?? [];
         const nextConnections = connections.filter(
           (connection) => connection.from_point_id !== id && connection.to_point_id !== id
         );
 
-        const bubbleEvents = get().bubbleEventsByNovel[novelId] ?? [];
+        const bubbleEvents = get().bubbleEventsByNovel[scopeKey] ?? [];
         const reanchoredEvents = bubbleEvents
           .map((event) => {
             if (event.anchor_point_id !== id) return event;
@@ -613,7 +1096,7 @@ export const useNovelStore = create<NovelStore>()(
           .filter((event): event is TimelineBubbleEvent => event !== null);
 
         const remainingEventIds = new Set(reanchoredEvents.map((event) => event.id));
-        const deps = get().eventDependenciesByNovel[novelId] ?? [];
+        const deps = get().eventDependenciesByNovel[scopeKey] ?? [];
         const nextDeps = deps.filter(
           (dep) => remainingEventIds.has(dep.from_event_id) && remainingEventIds.has(dep.to_event_id)
         );
@@ -621,33 +1104,33 @@ export const useNovelStore = create<NovelStore>()(
         set({
           timePointsByNovel: {
             ...get().timePointsByNovel,
-            [novelId]: next
+            [scopeKey]: next
           },
           timePointConnectionsByNovel: {
             ...get().timePointConnectionsByNovel,
-            [novelId]: nextConnections
+            [scopeKey]: nextConnections
           },
           bubbleEventsByNovel: {
             ...get().bubbleEventsByNovel,
-            [novelId]: reanchoredEvents
+            [scopeKey]: reanchoredEvents
           },
           eventDependenciesByNovel: {
             ...get().eventDependenciesByNovel,
-            [novelId]: nextDeps
+            [scopeKey]: nextDeps
           }
         });
       },
 
       addTimePointConnection: (fromPointId, toPointId) => {
-        const novelId = get().currentNovel?.id;
-        if (!novelId || fromPointId === toPointId) return;
+        const scopeKey = currentLayoutScopeKey(get());
+        if (!scopeKey || fromPointId === toPointId) return;
 
-        const points = get().timePointsByNovel[novelId] ?? [];
+        const points = get().timePointsByNovel[scopeKey] ?? [];
         const from = points.find((point) => point.id === fromPointId);
         const to = points.find((point) => point.id === toPointId);
         if (!from || !to || from.timeline_id === to.timeline_id) return;
 
-        const existing = get().timePointConnectionsByNovel[novelId] ?? [];
+        const existing = get().timePointConnectionsByNovel[scopeKey] ?? [];
         const alreadyExists = existing.some(
           (connection) =>
             (connection.from_point_id === fromPointId && connection.to_point_id === toPointId) ||
@@ -677,27 +1160,27 @@ export const useNovelStore = create<NovelStore>()(
         set({
           timePointsByNovel: {
             ...get().timePointsByNovel,
-            [novelId]: nextPoints
+            [scopeKey]: nextPoints
           },
           timePointConnectionsByNovel: {
             ...get().timePointConnectionsByNovel,
-            [novelId]: nextConnections
+            [scopeKey]: nextConnections
           }
         });
       },
 
       addBubbleEvent: (title, timelineId, preferredPosition) => {
-        const novelId = get().currentNovel?.id;
-        if (!novelId || !title.trim()) return false;
+        const scopeKey = currentLayoutScopeKey(get());
+        if (!scopeKey || !title.trim()) return false;
         const verticalMax =
-          get().timelineVerticalMaxByNovel[novelId] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
+          get().timelineVerticalMaxByNovel[scopeKey] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
 
-        const points = get().timePointsByNovel[novelId] ?? [];
+        const points = get().timePointsByNovel[scopeKey] ?? [];
         const clampedPreferred = clampPosition(preferredPosition, verticalMax);
         const anchor = selectAnchorPoint(points, timelineId, clampedPreferred);
         if (!anchor) return false;
 
-        const existing = get().bubbleEventsByNovel[novelId] ?? [];
+        const existing = get().bubbleEventsByNovel[scopeKey] ?? [];
         const sameTimelineCount = existing.filter((event) => event.timeline_id === timelineId).length;
         const offset = clampedPreferred - anchor.position;
         const next: TimelineBubbleEvent[] = [
@@ -715,68 +1198,81 @@ export const useNovelStore = create<NovelStore>()(
         set({
           bubbleEventsByNovel: {
             ...get().bubbleEventsByNovel,
-            [novelId]: next
+            [scopeKey]: next
           }
         });
         return true;
       },
 
       updateBubbleEventTitle: (eventId, title) => {
-        const novelId = get().currentNovel?.id;
-        if (!novelId) return;
+        const scopeKey = currentLayoutScopeKey(get());
+        if (!scopeKey) return;
         const trimmed = title.trim();
         if (!trimmed) return;
-        const existing = get().bubbleEventsByNovel[novelId] ?? [];
+        const existing = get().bubbleEventsByNovel[scopeKey] ?? [];
         const next = existing.map((event) => (event.id === eventId ? { ...event, title: trimmed } : event));
         set({
           bubbleEventsByNovel: {
             ...get().bubbleEventsByNovel,
-            [novelId]: next
+            [scopeKey]: next
           }
         });
       },
 
       moveBubbleEvent: (eventId, nextPosition) => {
-        const novelId = get().currentNovel?.id;
-        if (!novelId) return false;
+        const scopeKey = currentLayoutScopeKey(get());
+        if (!scopeKey) return false;
         const verticalMax =
-          get().timelineVerticalMaxByNovel[novelId] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
+          get().timelineVerticalMaxByNovel[scopeKey] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
 
-        const points = get().timePointsByNovel[novelId] ?? [];
-        const bubbles = get().bubbleEventsByNovel[novelId] ?? [];
-        const deps = get().eventDependenciesByNovel[novelId] ?? [];
+        const points = get().timePointsByNovel[scopeKey] ?? [];
+        const bubbles = get().bubbleEventsByNovel[scopeKey] ?? [];
+        const deps = get().eventDependenciesByNovel[scopeKey] ?? [];
         const target = bubbles.find((event) => event.id === eventId);
         if (!target) return false;
-
-        if (!selectAnchorPoint(points, target.timeline_id, nextPosition)) return false;
-
         const pointsById = new Map(points.map((point) => [point.id, point]));
+        const currentCenter = bubblePosition(target, pointsById);
         const clamped = clampPosition(nextPosition, verticalMax);
-        if (!canMoveBubbleEvent(target, clamped, bubbles, deps, pointsById)) return false;
+        const delta = clamped - currentCenter;
+        const linkedEventIds = connectedHorizontalDependencyEventIds(eventId, deps, bubbles);
+
+        for (let i = 0; i < bubbles.length; i += 1) {
+          const bubble = bubbles[i];
+          if (!linkedEventIds.has(bubble.id)) continue;
+          if (!selectAnchorPoint(points, bubble.timeline_id, clamped)) {
+            return false;
+          }
+        }
 
         const next = bubbles.map((event) =>
-          event.id === eventId
-            ? desiredBubblePosition(event, clamped, points, verticalMax)
+          linkedEventIds.has(event.id)
+            ? desiredBubblePosition(
+                event,
+                clampPosition(bubblePosition(event, pointsById) + delta, verticalMax),
+                points,
+                verticalMax
+              )
             : event
         );
 
         set({
           bubbleEventsByNovel: {
             ...get().bubbleEventsByNovel,
-            [novelId]: next
+            [scopeKey]: next
           }
         });
         return true;
       },
 
       settleBubbleEventPosition: (eventId) => {
-        const novelId = get().currentNovel?.id;
-        if (!novelId) return false;
+        const scopeKey = currentLayoutScopeKey(get());
+        if (!scopeKey) return false;
         const verticalMax =
-          get().timelineVerticalMaxByNovel[novelId] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
+          get().timelineVerticalMaxByNovel[scopeKey] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
 
-        const points = get().timePointsByNovel[novelId] ?? [];
-        const bubbles = get().bubbleEventsByNovel[novelId] ?? [];
+        const points = get().timePointsByNovel[scopeKey] ?? [];
+        const bubbles = get().bubbleEventsByNovel[scopeKey] ?? [];
+        const deps = get().eventDependenciesByNovel[scopeKey] ?? [];
         const target = bubbles.find((event) => event.id === eventId);
         if (!target) return false;
 
@@ -815,7 +1311,7 @@ export const useNovelStore = create<NovelStore>()(
 
         const shiftedPointById = new Map(shiftedTimelinePoints.map((point) => [point.id, point]));
         const candidatePoints = points.map((point) => shiftedPointById.get(point.id) ?? point);
-        const connections = get().timePointConnectionsByNovel[novelId] ?? [];
+        const connections = get().timePointConnectionsByNovel[scopeKey] ?? [];
         const alignedPoints = alignConnectedPoints(points, candidatePoints, connections, verticalMax);
         const nextPoints = enforceComponentPointClearance(
           alignedPoints,
@@ -905,56 +1401,77 @@ export const useNovelStore = create<NovelStore>()(
           };
         });
 
-        const next = [...untouched, ...finalizedResolved];
+        const nextBase = [...untouched, ...finalizedResolved];
+        const linkedEventIds = connectedHorizontalDependencyEventIds(eventId, deps, nextBase);
+        const clearedPointsByIdFinal = new Map(clearedPoints.map((point) => [point.id, point]));
+        const movingEvent = nextBase.find((event) => event.id === eventId);
+        const movingCenter = movingEvent
+          ? bubblePosition(movingEvent, clearedPointsByIdFinal)
+          : currentPosition;
+        const next = nextBase.map((event) => {
+          if (!linkedEventIds.has(event.id) || event.id === eventId) {
+            return event;
+          }
+          const currentPos = bubblePosition(event, clearedPointsByIdFinal);
+          const delta = movingCenter - currentPosition;
+          return desiredBubblePosition(
+            event,
+            clampPosition(currentPos + delta, verticalMax),
+            clearedPoints,
+            verticalMax
+          );
+        });
+
+        const unstuck = spreadCoincidentEvents(next, clearedPoints, verticalMax);
 
         set({
           timePointsByNovel: {
             ...get().timePointsByNovel,
-            [novelId]: clearedPoints
+            [scopeKey]: clearedPoints
           },
           bubbleEventsByNovel: {
             ...get().bubbleEventsByNovel,
-            [novelId]: next
+            [scopeKey]: unstuck
           }
         });
         return true;
       },
 
       deleteBubbleEvent: (eventId) => {
-        const novelId = get().currentNovel?.id;
-        if (!novelId) return;
-        const events = get().bubbleEventsByNovel[novelId] ?? [];
+        const scopeKey = currentLayoutScopeKey(get());
+        if (!scopeKey) return;
+        const events = get().bubbleEventsByNovel[scopeKey] ?? [];
         const nextEvents = events.filter((event) => event.id !== eventId);
-        const deps = get().eventDependenciesByNovel[novelId] ?? [];
+        const deps = get().eventDependenciesByNovel[scopeKey] ?? [];
         const nextDeps = deps.filter((dep) => dep.from_event_id !== eventId && dep.to_event_id !== eventId);
         set({
           bubbleEventsByNovel: {
             ...get().bubbleEventsByNovel,
-            [novelId]: nextEvents
+            [scopeKey]: nextEvents
           },
           eventDependenciesByNovel: {
             ...get().eventDependenciesByNovel,
-            [novelId]: nextDeps
+            [scopeKey]: nextDeps
           }
         });
       },
 
       addEventDependency: (fromEventId, toEventId) => {
-        const novelId = get().currentNovel?.id;
-        if (!novelId || fromEventId === toEventId) return false;
+        const scopeKey = currentLayoutScopeKey(get());
+        if (!scopeKey || fromEventId === toEventId) return false;
 
-        const events = get().bubbleEventsByNovel[novelId] ?? [];
-        const deps = get().eventDependenciesByNovel[novelId] ?? [];
+        const events = get().bubbleEventsByNovel[scopeKey] ?? [];
+        const deps = get().eventDependenciesByNovel[scopeKey] ?? [];
         const from = events.find((event) => event.id === fromEventId);
         const to = events.find((event) => event.id === toEventId);
-        if (!from || !to || from.timeline_id !== to.timeline_id) return false;
+        if (!from || !to) return false;
 
         const exists = deps.some(
           (dep) => dep.from_event_id === fromEventId && dep.to_event_id === toEventId
         );
         if (exists) return true;
 
-        const points = get().timePointsByNovel[novelId] ?? [];
+        const points = get().timePointsByNovel[scopeKey] ?? [];
         const pointsById = new Map(points.map((point) => [point.id, point]));
         const fromPos = bubblePosition(from, pointsById);
         const toPos = bubblePosition(to, pointsById);
@@ -974,47 +1491,70 @@ export const useNovelStore = create<NovelStore>()(
         set({
           eventDependenciesByNovel: {
             ...get().eventDependenciesByNovel,
-            [novelId]: nextDeps
+            [scopeKey]: nextDeps
           }
         });
         return true;
       },
 
       deleteEventDependency: (dependencyId) => {
-        const novelId = get().currentNovel?.id;
-        if (!novelId) return;
-        const deps = get().eventDependenciesByNovel[novelId] ?? [];
+        const scopeKey = currentLayoutScopeKey(get());
+        if (!scopeKey) return;
+        const deps = get().eventDependenciesByNovel[scopeKey] ?? [];
         const nextDeps = deps.filter((dep) => dep.id !== dependencyId);
         set({
           eventDependenciesByNovel: {
             ...get().eventDependenciesByNovel,
-            [novelId]: nextDeps
+            [scopeKey]: nextDeps
           }
         });
       },
 
       setBubbleEventSide: (eventId, side) => {
-        const novelId = get().currentNovel?.id;
-        if (!novelId) return;
-        const events = get().bubbleEventsByNovel[novelId] ?? [];
+        const scopeKey = currentLayoutScopeKey(get());
+        if (!scopeKey) return;
+        const events = get().bubbleEventsByNovel[scopeKey] ?? [];
         const nextEvents = events.map((event) => (event.id === eventId ? { ...event, side } : event));
         set({
           bubbleEventsByNovel: {
             ...get().bubbleEventsByNovel,
-            [novelId]: nextEvents
+            [scopeKey]: nextEvents
           }
         });
       },
 
+      repairCollapsedBubbleEvents: () => {
+        const scopeKey = currentLayoutScopeKey(get());
+        if (!scopeKey) return false;
+
+        const points = get().timePointsByNovel[scopeKey] ?? [];
+        const events = get().bubbleEventsByNovel[scopeKey] ?? [];
+        const verticalMax =
+          get().timelineVerticalMaxByNovel[scopeKey] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
+        const repaired = spreadCoincidentEvents(events, points, verticalMax);
+
+        if (JSON.stringify(repaired) === JSON.stringify(events)) {
+          return false;
+        }
+
+        set({
+          bubbleEventsByNovel: {
+            ...get().bubbleEventsByNovel,
+            [scopeKey]: repaired
+          }
+        });
+        return true;
+      },
+
       setTimelineColumnWidth: (timelineId, width) => {
-        const novelId = get().currentNovel?.id;
-        if (!novelId) return;
+        const scopeKey = currentLayoutScopeKey(get());
+        if (!scopeKey) return;
         const clamped = Math.max(150, Math.min(480, Math.round(width)));
-        const existing = get().timelineColumnWidthsByNovel[novelId] ?? {};
+        const existing = get().timelineColumnWidthsByNovel[scopeKey] ?? {};
         set({
           timelineColumnWidthsByNovel: {
             ...get().timelineColumnWidthsByNovel,
-            [novelId]: {
+            [scopeKey]: {
               ...existing,
               [timelineId]: clamped
             }
@@ -1023,15 +1563,15 @@ export const useNovelStore = create<NovelStore>()(
       },
 
       ensureTimelineVerticalExtent: (requestedPosition) => {
-        const novelId = get().currentNovel?.id;
-        if (!novelId) return DEFAULT_TIMELINE_VERTICAL_MAX;
+        const scopeKey = currentLayoutScopeKey(get());
+        if (!scopeKey) return DEFAULT_TIMELINE_VERTICAL_MAX;
 
-        const points = get().timePointsByNovel[novelId] ?? [];
-        const bubbles = get().bubbleEventsByNovel[novelId] ?? [];
+        const points = get().timePointsByNovel[scopeKey] ?? [];
+        const bubbles = get().bubbleEventsByNovel[scopeKey] ?? [];
         const contentMax = timelineContentMaxPosition(points, bubbles);
 
         const currentMax =
-          get().timelineVerticalMaxByNovel[novelId] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
+          get().timelineVerticalMaxByNovel[scopeKey] ?? DEFAULT_TIMELINE_VERTICAL_MAX;
         const safeRequested = Math.max(0, requestedPosition);
         const desiredContentMax = Math.max(contentMax, safeRequested);
 
@@ -1058,7 +1598,7 @@ export const useNovelStore = create<NovelStore>()(
         set({
           timelineVerticalMaxByNovel: {
             ...get().timelineVerticalMaxByNovel,
-            [novelId]: tightened
+            [scopeKey]: tightened
           }
         });
         return tightened;
@@ -1091,11 +1631,14 @@ export const useNovelStore = create<NovelStore>()(
 
           const payload: NovelPayload = await novelApi.getNovelPayload(currentNovel.id);
           const state = get();
-          const snapshot = snapshotFromPayload(payload);
+          const scoped = chapterScopedState(payload, state.currentChapter?.id ?? null);
+          const snapshot = snapshotFromPayload(payload, scoped.chapter?.id ?? null);
           const bounded = appendHistory(state.undo_history, state.undo_index, snapshot);
           set({
-            timelines: payload.timelines,
-            events: payload.events,
+            chapters: payload.chapters,
+            currentChapter: scoped.chapter,
+            timelines: scoped.timelines,
+            events: scoped.events,
             undo_history: bounded,
             undo_index: bounded.length - 1
           });
@@ -1109,6 +1652,7 @@ export const useNovelStore = create<NovelStore>()(
       name: 'novelic-ui-cache',
       partialize: (state) => ({
         currentNovel: state.currentNovel,
+        currentChapter: state.currentChapter,
         selectedCursor: state.selectedCursor,
         searchQuery: state.searchQuery,
         timePointsByNovel: state.timePointsByNovel,

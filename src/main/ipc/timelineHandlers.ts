@@ -19,12 +19,14 @@ export function registerTimelineHandlers(): void {
     assertNonEmptyString(novelId, 'novel id');
     return dbQueries.listTimelines(novelId);
   });
-  ipcMain.handle('timelines:create', (_event, input: { novel_id: string; name: string; color: string }) => {
+  ipcMain.handle('timelines:create', (_event, input: { novel_id: string; chapter_id: string; name: string; color: string }) => {
     assertNonEmptyString(input?.novel_id, 'novel id');
+    assertNonEmptyString(input?.chapter_id, 'chapter id');
     assertNonEmptyString(input?.name, 'timeline name');
     assertHexColor(input?.color);
     return dbQueries.createTimeline({
       novel_id: input.novel_id,
+      chapter_id: input.chapter_id,
       name: input.name.trim(),
       color: input.color
     });
@@ -32,6 +34,7 @@ export function registerTimelineHandlers(): void {
   ipcMain.handle('timelines:update', (_event, timeline: Timeline) => {
     assertNonEmptyString(timeline?.id, 'timeline id');
     assertNonEmptyString(timeline?.novel_id, 'novel id');
+    assertNonEmptyString(timeline?.chapter_id, 'chapter id');
     assertNonEmptyString(timeline?.name, 'timeline name');
     assertHexColor(timeline?.color);
     if (!Number.isInteger(timeline?.order_index) || timeline.order_index < 0) {

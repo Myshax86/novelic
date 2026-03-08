@@ -5,6 +5,7 @@ import { useNovelStore } from './store/useNovelStore';
 export default function App() {
   const initialize = useNovelStore((s) => s.initialize);
   const currentNovel = useNovelStore((s) => s.currentNovel);
+  const currentChapter = useNovelStore((s) => s.currentChapter);
 
   useEffect(() => {
     initialize();
@@ -24,8 +25,10 @@ export default function App() {
         </div>
 
         <div className="center-column">
-          {currentNovel ? (
+          {currentNovel && currentChapter ? (
             <TimelinePanel />
+          ) : currentNovel ? (
+            <section className="panel empty-state">No chapters yet. Add a chapter to start planning.</section>
           ) : (
             <section className="panel empty-state">Create or select a novel to begin.</section>
           )}

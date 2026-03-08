@@ -27,6 +27,7 @@ const { ipcHandlers, dbQueries } = vi.hoisted(() => ({
         created_at: '2026-01-01T00:00:00.000Z',
         updated_at: '2026-01-01T00:00:00.000Z'
       },
+      chapters: [],
       timelines: [],
       events: []
     }))
@@ -79,6 +80,7 @@ describe('IPC input validation', () => {
     expect(() =>
       invoke('timelines:create', {
         novel_id: 'n1',
+        chapter_id: 'c1',
         name: 'Main',
         color: '#12345'
       })
@@ -123,10 +125,21 @@ describe('IPC input validation', () => {
           created_at: '2026-01-01T00:00:00.000Z',
           updated_at: '2026-01-01T00:00:00.000Z'
         },
+        chapters: [
+          {
+            id: 'c1',
+            novel_id: 'n1',
+            name: 'Chapter 1',
+            order_index: 0,
+            created_at: '2026-01-01T00:00:00.000Z',
+            updated_at: '2026-01-01T00:00:00.000Z'
+          }
+        ],
         timelines: [
           {
             id: 't1',
             novel_id: 'n1',
+            chapter_id: 'c1',
             name: 'Main',
             color: '#de5b6d',
             order_index: 0,

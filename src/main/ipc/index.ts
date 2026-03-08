@@ -1,3 +1,4 @@
+import { registerChapterHandlers } from './chapterHandlers';
 import { registerEventHandlers } from './eventHandlers';
 import { registerNovelHandlers } from './novelHandlers';
 import { registerStateHandlers } from './stateHandlers';
@@ -12,6 +13,7 @@ export function registerIpcHandlers(): void {
   registered = true;
 
   registerNovelHandlers();
+  registerChapterHandlers();
   registerTimelineHandlers();
   registerEventHandlers();
   registerStateHandlers();

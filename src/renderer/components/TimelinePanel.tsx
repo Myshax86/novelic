@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type MouseEvent, type UIEvent, type WheelEvent } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState, type MouseEvent, type UIEvent, type WheelEvent } from 'react';
 import { useNovelStore } from '../store/useNovelStore';
 
 const AXIS_HEIGHT = 720;
@@ -48,6 +48,36 @@ function clampPosition(value: number, maxPosition: number): number {
   return Math.max(0, Math.min(maxPosition, value));
 }
 
+function darkenHexColor(color: string, amount = 0.24): string {
+  const hex = color.trim();
+  const normalized = hex.startsWith('#') ? hex.slice(1) : hex;
+  const isShortHex = normalized.length === 3;
+  const isFullHex = normalized.length === 6;
+
+  if (!/^[0-9a-fA-F]+$/.test(normalized) || (!isShortHex && !isFullHex)) {
+    return color;
+  }
+
+  const expanded = isShortHex
+    ? normalized
+        .split('')
+        .map((ch) => ch + ch)
+        .join('')
+    : normalized;
+
+  const r = Number.parseInt(expanded.slice(0, 2), 16);
+  const g = Number.parseInt(expanded.slice(2, 4), 16);
+  const b = Number.parseInt(expanded.slice(4, 6), 16);
+  const scale = Math.max(0, Math.min(1, 1 - amount));
+
+  const toHex = (value: number) =>
+    Math.round(value * scale)
+      .toString(16)
+      .padStart(2, '0');
+
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
 export function TimelinePanel() {
   const panelRef = useRef<HTMLElement | null>(null);
   const boardRef = useRef<HTMLDivElement | null>(null);
@@ -56,6 +86,7 @@ export function TimelinePanel() {
 
   const timelines = useNovelStore((s) => s.timelines);
   const currentNovel = useNovelStore((s) => s.currentNovel);
+  const currentChapter = useNovelStore((s) => s.currentChapter);
   const timePointsByNovel = useNovelStore((s) => s.timePointsByNovel);
   const timePointConnectionsByNovel = useNovelStore((s) => s.timePointConnectionsByNovel);
   const bubbleEventsByNovel = useNovelStore((s) => s.bubbleEventsByNovel);
@@ -80,6 +111,7 @@ export function TimelinePanel() {
   const setTimelineColumnWidth = useNovelStore((s) => s.setTimelineColumnWidth);
   const reorderTimelines = useNovelStore((s) => s.reorderTimelines);
   const ensureTimelineVerticalExtent = useNovelStore((s) => s.ensureTimelineVerticalExtent);
+  const captureLayoutSnapshot = useNovelStore((s) => s.captureLayoutSnapshot);
 
   const setCursor = useNovelStore((s) => s.setCursor);
 
@@ -105,10 +137,15 @@ export function TimelinePanel() {
   const [warning, setWarning] = useState<string | null>(null);
   const [virtualContentWidth, setVirtualContentWidth] = useState(0);
 
+  const layoutScopeId = useMemo(() => {
+    if (!currentNovel) return null;
+    return `${currentNovel.id}::${currentChapter?.id ?? '__no_chapter__'}`;
+  }, [currentNovel, currentChapter]);
+
   const rawPoints = useMemo(() => {
-    if (!currentNovel) return [];
-    return (timePointsByNovel[currentNovel.id] ?? []).slice().sort((a, b) => a.position - b.position);
-  }, [currentNovel, timePointsByNovel]);
+    if (!layoutScopeId) return [];
+    return (timePointsByNovel[layoutScopeId] ?? []).slice().sort((a, b) => a.position - b.position);
+  }, [layoutScopeId, timePointsByNovel]);
 
   const points = useMemo(
     () =>
@@ -120,19 +157,55 @@ export function TimelinePanel() {
   );
 
   const pointConnections = useMemo(() => {
-    if (!currentNovel) return [];
-    return timePointConnectionsByNovel[currentNovel.id] ?? [];
-  }, [currentNovel, timePointConnectionsByNovel]);
+    if (!layoutScopeId) return [];
+    return timePointConnectionsByNovel[layoutScopeId] ?? [];
+  }, [layoutScopeId, timePointConnectionsByNovel]);
 
   const bubbleEvents = useMemo(() => {
-    if (!currentNovel) return [];
-    return bubbleEventsByNovel[currentNovel.id] ?? [];
-  }, [currentNovel, bubbleEventsByNovel]);
+    if (!layoutScopeId) return [];
+    return bubbleEventsByNovel[layoutScopeId] ?? [];
+  }, [layoutScopeId, bubbleEventsByNovel]);
 
   const bubbleDeps = useMemo(() => {
-    if (!currentNovel) return [];
-    return eventDependenciesByNovel[currentNovel.id] ?? [];
-  }, [currentNovel, eventDependenciesByNovel]);
+    if (!layoutScopeId) return [];
+    return eventDependenciesByNovel[layoutScopeId] ?? [];
+  }, [layoutScopeId, eventDependenciesByNovel]);
+
+  const linkedDraggedEventIds = useMemo(() => {
+    const activeEventId = draggingBubbleId ?? depDragFromEventId;
+    if (!activeEventId) return new Set<string>();
+    const bubbleById = new Map(bubbleEvents.map((event) => [event.id, event]));
+
+    const adjacency = new Map<string, Set<string>>();
+    const link = (a: string, b: string) => {
+      if (!adjacency.has(a)) adjacency.set(a, new Set<string>());
+      adjacency.get(a)?.add(b);
+    };
+
+    bubbleDeps.forEach((dep) => {
+      const from = bubbleById.get(dep.from_event_id);
+      const to = bubbleById.get(dep.to_event_id);
+      if (!from || !to) return;
+      if (from.timeline_id === to.timeline_id) return;
+      link(dep.from_event_id, dep.to_event_id);
+      link(dep.to_event_id, dep.from_event_id);
+    });
+
+    const visited = new Set<string>([activeEventId]);
+    const queue = [activeEventId];
+    while (queue.length > 0) {
+      const current = queue.shift() as string;
+      const neighbors = adjacency.get(current);
+      if (!neighbors) continue;
+      neighbors.forEach((neighbor) => {
+        if (visited.has(neighbor)) return;
+        visited.add(neighbor);
+        queue.push(neighbor);
+      });
+    }
+
+    return visited;
+  }, [draggingBubbleId, depDragFromEventId, bubbleDeps, bubbleEvents]);
 
   const pointById = useMemo(() => new Map(points.map((point) => [point.id, point])), [points]);
   const bubbleById = useMemo(() => new Map(bubbleEvents.map((event) => [event.id, event])), [bubbleEvents]);
@@ -155,14 +228,17 @@ export function TimelinePanel() {
       const delta = event.clientX - timelineResizeState.startX;
       setTimelineColumnWidth(timelineResizeState.timelineId, timelineResizeState.startWidth + delta);
     };
-    const onUp = () => setTimelineResizeState(null);
+    const onUp = () => {
+      setTimelineResizeState(null);
+      captureLayoutSnapshot();
+    };
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
     return () => {
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
     };
-  }, [timelineResizeState, setTimelineColumnWidth]);
+  }, [timelineResizeState, setTimelineColumnWidth, captureLayoutSnapshot]);
 
   const openContextMenu = (x: number, y: number, target: TimelineContextMenu['target']) => {
     const rect = panelRef.current?.getBoundingClientRect();
@@ -181,10 +257,10 @@ export function TimelinePanel() {
         id: timeline.id,
         name: timeline.name,
         color: timeline.color,
-        width: timelineColumnWidthsByNovel[currentNovel?.id ?? '']?.[timeline.id] ?? ENTITY_COLUMN_WIDTH
+        width: timelineColumnWidthsByNovel[layoutScopeId ?? '']?.[timeline.id] ?? ENTITY_COLUMN_WIDTH
       }))
     ],
-    [timelines, timelineColumnWidthsByNovel, currentNovel]
+    [timelines, timelineColumnWidthsByNovel, layoutScopeId]
   );
 
   const columnIndexById = useMemo(
@@ -209,7 +285,7 @@ export function TimelinePanel() {
   );
 
   const verticalMax = currentNovel
-    ? timelineVerticalMaxByNovel[currentNovel.id] ?? DEFAULT_VERTICAL_MAX
+    ? timelineVerticalMaxByNovel[layoutScopeId ?? ''] ?? DEFAULT_VERTICAL_MAX
     : DEFAULT_VERTICAL_MAX;
   const axisHeight = Math.max(AXIS_HEIGHT, Math.round(AXIS_HEIGHT * verticalMax));
   const renderedContentWidth = Math.max(contentWidth, virtualContentWidth || contentWidth);
@@ -265,16 +341,19 @@ export function TimelinePanel() {
 
   const savePointEditor = () => {
     if (!pointEditor || !pointEditor.label.trim()) return;
+    captureLayoutSnapshot();
     if (pointEditor.mode === 'create') {
       addTimePoint(pointEditor.label.trim(), pointEditor.position, pointEditor.timelineId);
     } else if (pointEditor.id) {
       updateTimePoint(pointEditor.id, pointEditor.label.trim());
     }
+    captureLayoutSnapshot();
     setPointEditor(null);
   };
 
   const saveBubbleEditor = () => {
     if (!bubbleEditor || !bubbleEditor.title.trim()) return;
+    captureLayoutSnapshot();
     if (bubbleEditor.mode === 'create') {
       const created = addBubbleEvent(bubbleEditor.title.trim(), bubbleEditor.timelineId, bubbleEditor.position);
       if (!created) {
@@ -284,6 +363,7 @@ export function TimelinePanel() {
     } else if (bubbleEditor.id) {
       updateBubbleEventTitle(bubbleEditor.id, bubbleEditor.title.trim());
     }
+    captureLayoutSnapshot();
     setBubbleEditor(null);
   };
 
@@ -367,7 +447,7 @@ export function TimelinePanel() {
 
   return (
     <section className="panel timeline-panel" ref={panelRef}>
-      <h2>Timeline Anchors</h2>
+      <h2>{currentChapter?.name ?? 'Chapter'}</h2>
       <div className="timeline-mode-row">
         <button
           aria-pressed={mode === 'point'}
@@ -430,10 +510,14 @@ export function TimelinePanel() {
               const from = bubbleById.get(dep.from_event_id);
               const to = bubbleById.get(dep.to_event_id);
               if (!from || !to) return null;
-              const center = columnCenterX.get(from.timeline_id);
-              if (center == null) return null;
-              const fromX = center + (from.side === 'left' ? -BUBBLE_X_OFFSET : BUBBLE_X_OFFSET);
-              const toX = center + (to.side === 'left' ? -BUBBLE_X_OFFSET : BUBBLE_X_OFFSET);
+              const fromCenter = columnCenterX.get(from.timeline_id);
+              const toCenter = columnCenterX.get(to.timeline_id);
+              if (fromCenter == null || toCenter == null) return null;
+              const fromX = fromCenter + (from.side === 'left' ? -BUBBLE_X_OFFSET : BUBBLE_X_OFFSET);
+              const toX = toCenter + (to.side === 'left' ? -BUBBLE_X_OFFSET : BUBBLE_X_OFFSET);
+              const isLinked =
+                linkedDraggedEventIds.has(dep.from_event_id) &&
+                linkedDraggedEventIds.has(dep.to_event_id);
               return (
                 <line
                   key={dep.id}
@@ -444,7 +528,7 @@ export function TimelinePanel() {
                   stroke="rgba(215, 58, 73, 0.7)"
                   strokeWidth="2"
                   strokeDasharray="6 4"
-                  className="bubble-dependency-line"
+                  className={`bubble-dependency-line${isLinked ? ' is-linked' : ''}`}
                   onContextMenu={(e) => {
                     e.preventDefault();
                     e.stopPropagation();
@@ -516,6 +600,7 @@ export function TimelinePanel() {
                       onPointerDown={(e) => {
                         e.preventDefault();
                         e.stopPropagation();
+                        captureLayoutSnapshot();
                         setTimelineResizeState({
                           timelineId: column.id,
                           startX: e.clientX,
@@ -580,6 +665,7 @@ export function TimelinePanel() {
                       onPointerDown={(e) => {
                         if (e.button !== 0) return;
                         e.stopPropagation();
+                        captureLayoutSnapshot();
                         setDraggingPointId(point.id);
                         (e.currentTarget as HTMLButtonElement).setPointerCapture(e.pointerId);
                       }}
@@ -596,6 +682,7 @@ export function TimelinePanel() {
                         if (draggingPointId !== point.id) return;
                         (e.currentTarget as HTMLButtonElement).releasePointerCapture(e.pointerId);
                         setDraggingPointId(null);
+                        captureLayoutSnapshot();
                       }}
                       onContextMenu={(e) => {
                         e.preventDefault();
@@ -612,7 +699,9 @@ export function TimelinePanel() {
                         e.stopPropagation();
                         const fromId = e.dataTransfer.getData('application/x-novelic-point-id') || linkDragFromPointId;
                         if (!fromId || fromId === point.id) return;
+                        captureLayoutSnapshot();
                         addTimePointConnection(fromId, point.id);
+                        captureLayoutSnapshot();
                         setLinkDragFromPointId(null);
                       }}
                     >
@@ -636,100 +725,112 @@ export function TimelinePanel() {
                     const pos = bubblePosition(eventBubble);
                     const sideClass = eventBubble.side === 'left' ? 'bubble-left' : 'bubble-right';
                     const availableWidth = bubbleMaxWidth(eventBubble);
+                    const isLinked = linkedDraggedEventIds.has(eventBubble.id);
+                    const timelineColor = isMain ? '#d73a49' : column.color;
+                    const anchorDotColor = darkenHexColor(timelineColor, 0.3);
                     return (
-                      <div
-                        key={eventBubble.id}
-                        className={`timeline-bubble ${sideClass}${draggingBubbleId === eventBubble.id ? ' is-dragging' : ''}`}
-                        style={{
-                          top: `${positionToTop(pos)}px`,
-                          width: `${availableWidth}px`,
-                          maxWidth: `${availableWidth}px`
-                        }}
-                        onClick={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                        }}
-                        onDoubleClick={(e) => {
-                          e.stopPropagation();
-                          const target = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
-                          const axisRect = (e.currentTarget.parentElement as HTMLDivElement).getBoundingClientRect();
-                          setBubbleEditor({
-                            mode: 'edit',
-                            id: eventBubble.id,
-                            position: pos,
-                            title: eventBubble.title,
-                            x: target.left - axisRect.left,
-                            timelineId: eventBubble.timeline_id
-                          });
-                          setPointEditor(null);
-                        }}
-                        onPointerDown={(e) => {
-                          if (e.button !== 0) return;
-                          e.stopPropagation();
-                          setDraggingBubbleId(eventBubble.id);
-                          (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
-                        }}
-                        onPointerMove={(e) => {
-                          if (draggingBubbleId !== eventBubble.id) return;
-                          const axis = (e.currentTarget.parentElement as HTMLDivElement).getBoundingClientRect();
-                          const requested = (e.clientY - axis.top) / AXIS_HEIGHT;
-                          const nextMax = ensureTimelineVerticalExtent(requested + 0.1);
-                          const nextPosition = clampPosition(requested, nextMax);
-                          const side = e.clientX < axis.left + axis.width / 2 ? 'left' : 'right';
-                          if (side !== eventBubble.side) {
-                            setBubbleEventSide(eventBubble.id, side);
-                          }
-                          const ok = moveBubbleEvent(eventBubble.id, nextPosition);
-                          if (!ok) {
-                            setWarning('Dependency order blocks this move.');
-                          }
-                        }}
-                        onPointerUp={(e) => {
-                          if (draggingBubbleId !== eventBubble.id) return;
-                          (e.currentTarget as HTMLDivElement).releasePointerCapture(e.pointerId);
-                          setDraggingBubbleId(null);
-                          settleBubbleEventPosition(eventBubble.id);
-                        }}
-                        onContextMenu={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          openContextMenu(e.clientX, e.clientY, { type: 'bubble', id: eventBubble.id });
-                        }}
-                        onDragOver={(e) => {
-                          const fromId = e.dataTransfer.getData('application/x-novelic-event-id') || depDragFromEventId;
-                          if (fromId && fromId !== eventBubble.id) {
-                            e.preventDefault();
-                          }
-                        }}
-                        onDrop={(e) => {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          const fromId = e.dataTransfer.getData('application/x-novelic-event-id') || depDragFromEventId;
-                          if (!fromId || fromId === eventBubble.id) return;
-                          const ok = addEventDependency(fromId, eventBubble.id);
-                          if (!ok) {
-                            setWarning('Dependencies can be created only within the same timeline.');
-                          }
-                          setDepDragFromEventId(null);
-                        }}
-                      >
-                        <span>{eventBubble.title}</span>
-                        <span
-                          className="bubble-dependency-handle"
-                          draggable
-                          onPointerDown={(e) => {
-                            e.stopPropagation();
-                          }}
-                          onDragStart={(e) => {
-                            e.stopPropagation();
-                            setDepDragFromEventId(eventBubble.id);
-                            e.dataTransfer.effectAllowed = 'link';
-                            e.dataTransfer.setData('application/x-novelic-event-id', eventBubble.id);
-                          }}
-                          onDragEnd={() => setDepDragFromEventId(null)}
-                          title="Drag to another event to create dependency"
+                      <Fragment key={eventBubble.id}>
+                        <div
+                          className="bubble-anchor-dot"
+                          style={{ top: `${positionToTop(pos)}px`, backgroundColor: anchorDotColor }}
                         />
-                      </div>
+                        <div
+                          className={`timeline-bubble ${sideClass}${draggingBubbleId === eventBubble.id ? ' is-dragging' : ''}${isLinked ? ' is-linked' : ''}`}
+                          style={{
+                            top: `${positionToTop(pos)}px`,
+                            width: `${availableWidth}px`,
+                            maxWidth: `${availableWidth}px`
+                          }}
+                          onClick={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                          }}
+                          onDoubleClick={(e) => {
+                            e.stopPropagation();
+                            const target = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
+                            const axisRect = (e.currentTarget.parentElement as HTMLDivElement).getBoundingClientRect();
+                            setBubbleEditor({
+                              mode: 'edit',
+                              id: eventBubble.id,
+                              position: pos,
+                              title: eventBubble.title,
+                              x: target.left - axisRect.left,
+                              timelineId: eventBubble.timeline_id
+                            });
+                            setPointEditor(null);
+                          }}
+                          onPointerDown={(e) => {
+                            if (e.button !== 0) return;
+                            e.stopPropagation();
+                            captureLayoutSnapshot();
+                            setDraggingBubbleId(eventBubble.id);
+                            (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
+                          }}
+                          onPointerMove={(e) => {
+                            if (draggingBubbleId !== eventBubble.id) return;
+                            const axis = (e.currentTarget.parentElement as HTMLDivElement).getBoundingClientRect();
+                            const requested = (e.clientY - axis.top) / AXIS_HEIGHT;
+                            const nextMax = ensureTimelineVerticalExtent(requested + 0.1);
+                            const nextPosition = clampPosition(requested, nextMax);
+                            const side = e.clientX < axis.left + axis.width / 2 ? 'left' : 'right';
+                            if (side !== eventBubble.side) {
+                              setBubbleEventSide(eventBubble.id, side);
+                            }
+                            const ok = moveBubbleEvent(eventBubble.id, nextPosition);
+                            if (!ok) {
+                              setWarning('Dependency order blocks this move.');
+                            }
+                          }}
+                          onPointerUp={(e) => {
+                            if (draggingBubbleId !== eventBubble.id) return;
+                            (e.currentTarget as HTMLDivElement).releasePointerCapture(e.pointerId);
+                            setDraggingBubbleId(null);
+                            settleBubbleEventPosition(eventBubble.id);
+                            captureLayoutSnapshot();
+                          }}
+                          onContextMenu={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            openContextMenu(e.clientX, e.clientY, { type: 'bubble', id: eventBubble.id });
+                          }}
+                          onDragOver={(e) => {
+                            const fromId = e.dataTransfer.getData('application/x-novelic-event-id') || depDragFromEventId;
+                            if (fromId && fromId !== eventBubble.id) {
+                              e.preventDefault();
+                            }
+                          }}
+                          onDrop={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const fromId = e.dataTransfer.getData('application/x-novelic-event-id') || depDragFromEventId;
+                            if (!fromId || fromId === eventBubble.id) return;
+                            captureLayoutSnapshot();
+                            const ok = addEventDependency(fromId, eventBubble.id);
+                            if (!ok) {
+                              setWarning('Could not create dependency.');
+                            }
+                            captureLayoutSnapshot();
+                            setDepDragFromEventId(null);
+                          }}
+                        >
+                          <span>{eventBubble.title}</span>
+                          <span
+                            className="bubble-dependency-handle"
+                            draggable
+                            onPointerDown={(e) => {
+                              e.stopPropagation();
+                            }}
+                            onDragStart={(e) => {
+                              e.stopPropagation();
+                              setDepDragFromEventId(eventBubble.id);
+                              e.dataTransfer.effectAllowed = 'link';
+                              e.dataTransfer.setData('application/x-novelic-event-id', eventBubble.id);
+                            }}
+                            onDragEnd={() => setDepDragFromEventId(null)}
+                            title="Drag to another event to create dependency"
+                          />
+                        </div>
+                      </Fragment>
                     );
                   })}
 
@@ -800,23 +901,31 @@ export function TimelinePanel() {
             className="timeline-context-menu-remove"
             onClick={() => {
               if (contextMenu.target.type === 'point') {
+                captureLayoutSnapshot();
                 deleteTimePoint(contextMenu.target.id);
+                captureLayoutSnapshot();
               }
               if (contextMenu.target.type === 'connection' && currentNovel) {
-                const existing = timePointConnectionsByNovel[currentNovel.id] ?? [];
+                const existing = timePointConnectionsByNovel[layoutScopeId ?? ''] ?? [];
                 const next = existing.filter((item) => item.id !== contextMenu.target.id);
+                captureLayoutSnapshot();
                 useNovelStore.setState((state) => ({
                   timePointConnectionsByNovel: {
                     ...state.timePointConnectionsByNovel,
-                    [currentNovel.id]: next
+                    [layoutScopeId ?? '']: next
                   }
                 }));
+                captureLayoutSnapshot();
               }
               if (contextMenu.target.type === 'bubble') {
+                captureLayoutSnapshot();
                 deleteBubbleEvent(contextMenu.target.id);
+                captureLayoutSnapshot();
               }
               if (contextMenu.target.type === 'bubble-dependency') {
+                captureLayoutSnapshot();
                 deleteEventDependency(contextMenu.target.id);
+                captureLayoutSnapshot();
               }
               setContextMenu(null);
             }}

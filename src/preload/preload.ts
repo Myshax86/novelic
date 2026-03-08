@@ -1,9 +1,11 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type {
+  CreateChapterInput,
   CreateEventInput,
   CreateNovelInput,
   CreateTimelineInput,
   NovelPayload,
+  UpdateChapterInput,
   Timeline,
   UpdateEventInput
 } from '../shared/types';
@@ -14,6 +16,12 @@ const api = {
     create: (input: CreateNovelInput) => ipcRenderer.invoke('novels:create', input),
     delete: (novelId: string) => ipcRenderer.invoke('novels:delete', novelId),
     getPayload: (novelId: string) => ipcRenderer.invoke('novels:getPayload', novelId)
+  },
+  chapters: {
+    list: (novelId: string) => ipcRenderer.invoke('chapters:list', novelId),
+    create: (input: CreateChapterInput) => ipcRenderer.invoke('chapters:create', input),
+    update: (input: UpdateChapterInput) => ipcRenderer.invoke('chapters:update', input),
+    delete: (chapterId: string) => ipcRenderer.invoke('chapters:delete', chapterId)
   },
   timelines: {
     list: (novelId: string) => ipcRenderer.invoke('timelines:list', novelId),
@@ -26,8 +34,8 @@ const api = {
     create: (input: CreateEventInput) => ipcRenderer.invoke('events:create', input),
     update: (input: UpdateEventInput) => ipcRenderer.invoke('events:update', input),
     delete: (id: string) => ipcRenderer.invoke('events:delete', id),
-    getOverlapping: (novelId: string, cursorDate: string) =>
-      ipcRenderer.invoke('events:getOverlapping', novelId, cursorDate)
+    getOverlapping: (novelId: string, cursorDate: string, chapterId?: string) =>
+      ipcRenderer.invoke('events:getOverlapping', novelId, cursorDate, chapterId)
   },
   state: {
     createSnapshot: (novelId: string, payload: string) =>

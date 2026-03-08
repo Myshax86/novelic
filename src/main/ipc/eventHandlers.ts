@@ -56,9 +56,12 @@ export function registerEventHandlers(): void {
     dbQueries.deleteEvent(id);
     return { ok: true };
   });
-  ipcMain.handle('events:getOverlapping', (_event, novelId: string, cursorDate: string) => {
+  ipcMain.handle('events:getOverlapping', (_event, novelId: string, cursorDate: string, chapterId?: string) => {
     assertNonEmptyString(novelId, 'novel id');
     assertIsoDate(cursorDate, 'cursor date');
-    return dbQueries.getOverlappingEvents(novelId, cursorDate);
+    if (chapterId != null) {
+      assertNonEmptyString(chapterId, 'chapter id');
+    }
+    return dbQueries.getOverlappingEvents(novelId, cursorDate, chapterId);
   });
 }

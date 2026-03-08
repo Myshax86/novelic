@@ -5,9 +5,19 @@ export interface Novel {
   updated_at: string;
 }
 
+export interface Chapter {
+  id: string;
+  novel_id: string;
+  name: string;
+  order_index: number;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface Timeline {
   id: string;
   novel_id: string;
+  chapter_id: string;
   name: string;
   color: string;
   order_index: number;
@@ -36,6 +46,7 @@ export interface Snapshot {
 
 export interface NovelPayload {
   novel: Novel;
+  chapters: Chapter[];
   timelines: Timeline[];
   events: TimelineEvent[];
 }
@@ -46,8 +57,20 @@ export interface CreateNovelInput {
 
 export interface CreateTimelineInput {
   novel_id: string;
+  chapter_id: string;
   name: string;
   color: string;
+}
+
+export interface CreateChapterInput {
+  novel_id: string;
+  name: string;
+}
+
+export interface UpdateChapterInput {
+  id: string;
+  novel_id: string;
+  name: string;
 }
 
 export interface CreateEventInput {

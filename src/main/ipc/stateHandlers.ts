@@ -26,7 +26,12 @@ function assertNovelPayload(payload: unknown): asserts payload is NovelPayload {
     throw new Error('Invalid payload');
   }
   const candidate = payload as NovelPayload;
-  if (!candidate.novel?.id || !Array.isArray(candidate.timelines) || !Array.isArray(candidate.events)) {
+  if (
+    !candidate.novel?.id ||
+    !Array.isArray(candidate.chapters) ||
+    !Array.isArray(candidate.timelines) ||
+    !Array.isArray(candidate.events)
+  ) {
     throw new Error('Invalid payload shape');
   }
 
@@ -34,6 +39,24 @@ function assertNovelPayload(payload: unknown): asserts payload is NovelPayload {
   assertNonEmptyString(candidate.novel.name, 'novel name');
   assertIsoDate(candidate.novel.created_at, 'novel created_at');
   assertIsoDate(candidate.novel.updated_at, 'novel updated_at');
+
+  const chapterIds = new Set<string>();
+  candidate.chapters.forEach((chapter) => {
+    assertNonEmptyString(chapter.id, 'chapter id');
+    if (chapterIds.has(chapter.id)) {
+      throw new Error('Duplicate chapter id in payload');
+    }
+    chapterIds.add(chapter.id);
+    if (chapter.novel_id !== candidate.novel.id) {
+      throw new Error('Chapter novel_id must match imported novel id');
+    }
+    assertNonEmptyString(chapter.name, 'chapter name');
+    if (!Number.isInteger(chapter.order_index) || chapter.order_index < 0) {
+      throw new Error('Invalid chapter order index');
+    }
+    assertIsoDate(chapter.created_at, 'chapter created_at');
+    assertIsoDate(chapter.updated_at, 'chapter updated_at');
+  });
 
   const timelineIds = new Set<string>();
   candidate.timelines.forEach((timeline) => {
@@ -44,6 +67,9 @@ function assertNovelPayload(payload: unknown): asserts payload is NovelPayload {
     timelineIds.add(timeline.id);
     if (timeline.novel_id !== candidate.novel.id) {
       throw new Error('Timeline novel_id must match imported novel id');
+    }
+    if (!chapterIds.has(timeline.chapter_id)) {
+      throw new Error('Timeline chapter_id must reference an imported chapter');
     }
     assertNonEmptyString(timeline.name, 'timeline name');
     assertHexColor(timeline.color);

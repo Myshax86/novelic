@@ -1,9 +1,11 @@
-import type { Novel, NovelPayload, Timeline, TimelineEvent } from '../../shared/types';
+import type { Chapter, Novel, NovelPayload, Timeline, TimelineEvent } from '../../shared/types';
 
 export interface LocalSnapshot {
   novel: Novel;
+  chapters: Chapter[];
   timelines: Timeline[];
   events: TimelineEvent[];
+  currentChapterId: string | null;
 }
 
 const MAX_UNDO = 50;
@@ -11,16 +13,20 @@ const MAX_UNDO = 50;
 function cloneSnapshot(snapshot: LocalSnapshot): LocalSnapshot {
   return {
     novel: { ...snapshot.novel },
+    chapters: snapshot.chapters.map((chapter) => ({ ...chapter })),
     timelines: snapshot.timelines.map((timeline) => ({ ...timeline })),
-    events: snapshot.events.map((event) => ({ ...event }))
+    events: snapshot.events.map((event) => ({ ...event })),
+    currentChapterId: snapshot.currentChapterId
   };
 }
 
-export function snapshotFromPayload(payload: NovelPayload): LocalSnapshot {
+export function snapshotFromPayload(payload: NovelPayload, currentChapterId: string | null): LocalSnapshot {
   return {
     novel: { ...payload.novel },
+    chapters: payload.chapters.map((chapter) => ({ ...chapter })),
     timelines: payload.timelines.map((timeline) => ({ ...timeline })),
-    events: payload.events.map((event) => ({ ...event }))
+    events: payload.events.map((event) => ({ ...event })),
+    currentChapterId
   };
 }
 
